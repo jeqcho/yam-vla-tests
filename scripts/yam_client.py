@@ -83,11 +83,19 @@ class RealSenseStream(CameraStream):
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
         self.pipeline = rs.pipeline()
         self.pipeline.start(cfg)
+        # D405 sometimes takes >1s to produce its first frame after start().
+        # Drop a few warmup frames with a generous timeout so the first real
+        # grab() doesn't time out (cf. scripts/capture_frames.py).
+        for _ in range(5):
+            try:
+                self.pipeline.wait_for_frames(timeout_ms=2000)
+            except Exception:
+                pass
         log.info("camera %s (RealSense %s) started @ %dx%d/%d Hz", self.name, self.serial,
                  self.width, self.height, self.fps)
 
     def grab(self) -> np.ndarray:
-        frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+        frames = self.pipeline.wait_for_frames(timeout_ms=2000)
         color = frames.get_color_frame()
         if not color:
             raise RuntimeError(f"camera {self.name} ({self.serial}) produced no color frame")
