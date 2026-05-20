@@ -140,15 +140,16 @@ class V4L2Stream(CameraStream):
             self.cap.release()
 
 
-def make_camera(name: str, serial: Optional[str], v4l2_device: Optional[str]) -> CameraStream:
+def make_camera(name: str, serial: Optional[str], v4l2_device: Optional[str],
+                width: int, height: int, fps: int) -> CameraStream:
     """Build the right camera backend based on which CLI flag was set."""
     if serial and v4l2_device:
         raise ValueError(f"{name}: pass exactly one of --{name}-cam-serial / --{name}-cam-v4l2")
     if not serial and not v4l2_device:
         raise ValueError(f"{name}: must pass --{name}-cam-serial or --{name}-cam-v4l2")
     if serial:
-        return RealSenseStream(serial, name)
-    return V4L2Stream(v4l2_device, name)
+        return RealSenseStream(serial, name, width=width, height=height, fps=fps)
+    return V4L2Stream(v4l2_device, name, width=width, height=height, fps=fps)
 
 
 def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None) -> Robot:
@@ -266,6 +267,13 @@ def main() -> None:
     p.add_argument("--left-cam-v4l2",    default=None, help="V4L2 device path for left-arm camera")
     p.add_argument("--right-cam-serial", default=None, help="RealSense serial for right-arm camera")
     p.add_argument("--right-cam-v4l2",   default=None, help="V4L2 device path for right-arm camera")
+    # Bandwidth-tunable camera config. Defaults sized for two D405s on USB 2.0
+    # (~9.2 MB/s each at 424x240 RGB8 / 30 fps -- 18.4 MB/s total, fits the
+    # ~40 MB/s practical ceiling of USB 2.0 with headroom for CAN + webcam).
+    # Bump these if the cameras land on a USB 3.0 controller.
+    p.add_argument("--cam-width",  type=int, default=424)
+    p.add_argument("--cam-height", type=int, default=240)
+    p.add_argument("--cam-fps",    type=int, default=30)
     p.add_argument("--server-url", default="http://127.0.0.1:8202/act",
                    help="MolmoAct2 server /act endpoint")
     p.add_argument("--instruction", required=True,
@@ -301,10 +309,13 @@ def main() -> None:
     left = init_arm(args.left_can, args.left_gripper)
     right = init_arm(args.right_can, args.right_gripper)
 
-    # Cameras — each slot can be RealSense or V4L2 independently.
-    top   = make_camera("top",   args.top_cam_serial,   args.top_cam_v4l2)
-    cam_l = make_camera("left",  args.left_cam_serial,  args.left_cam_v4l2)
-    cam_r = make_camera("right", args.right_cam_serial, args.right_cam_v4l2)
+    # Cameras — each slot can be RealSense or V4L2 independently. Resolution
+    # applies to all three; the MolmoAct2 image processor tiles adaptively so
+    # any reasonable size works (training was at 256x342).
+    cam_kw = dict(width=args.cam_width, height=args.cam_height, fps=args.cam_fps)
+    top   = make_camera("top",   args.top_cam_serial,   args.top_cam_v4l2,   **cam_kw)
+    cam_l = make_camera("left",  args.left_cam_serial,  args.left_cam_v4l2,  **cam_kw)
+    cam_r = make_camera("right", args.right_cam_serial, args.right_cam_v4l2, **cam_kw)
     for c in (top, cam_l, cam_r):
         c.start()
 
