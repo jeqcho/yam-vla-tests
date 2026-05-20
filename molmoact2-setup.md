@@ -11,7 +11,7 @@
 - ✅ Client bridge `scripts/yam_client.py` — 2 YAM follower arms + 3 RealSense cameras, polls the server, applies per-tick-clipped joint commands
 - ✅ Utilities: `scripts/preflight.py`, `scripts/list_cams.py`, `scripts/capture_frames.py`, `scripts/smoke_test_server.py`
 - ✅ Blackwell sm_120 / RTX 5090: server runs cleanly on torch 2.8.0+cu128 (the Ai2-pinned cu121 wheels failed with `no kernel image is available`).
-- ✅ The legacy bf16 patches in `host_server_yam.py` log `needle not found` — that's expected on the YAM revision (fixed upstream); bf16 inference works regardless.
+- ✅ The bf16 patches in `host_server_yam.py` log `needle not found` on the YAM revision — per Ai2's CLAUDE.md, both needles are fixed upstream on YAM (unlike DROID, where one is still required), so bf16 inference works without patching.
 
 ### Smoke-test stdout (from `scripts/smoke_test_server.py`, T+75m)
 
