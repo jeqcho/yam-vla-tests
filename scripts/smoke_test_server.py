@@ -46,10 +46,8 @@ def main() -> int:
     yy, xx = np.mgrid[0:args.height, 0:args.width].astype(np.float32)
     grad = (xx / args.width * 255).astype(np.uint8)
     base_img = np.stack([grad, grad, grad], axis=-1)
-    top   = base_img.copy()
-    left  = (base_img.T[:args.height, :args.width] if base_img.T.shape[0] >= args.height else base_img).copy() if False else base_img.copy()
-    right = base_img.copy()
-    # Stamp a label so the three frames are visibly different (lower-right corner).
+    top, left, right = base_img.copy(), base_img.copy(), base_img.copy()
+    # Stamp a colored corner so the three frames are visibly different.
     top[-20:, -40:, 0] = 255   # red blob on top
     left[-20:, -40:, 1] = 255  # green on left
     right[-20:, -40:, 2] = 255 # blue on right
