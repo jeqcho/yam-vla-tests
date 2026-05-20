@@ -7,11 +7,23 @@
 ## Bottom line
 
 By the time you're back, this should be true:
-- ✅ MolmoAct2 inference server installable with `cd molmoact2-setup && uv sync` — deps already cached
-- ✅ Model weights `allenai/MolmoAct2-BimanualYAM` (~22 GB) downloading into `molmoact2-setup/hf-cache/` (in progress)
+- ✅ **MolmoAct2 inference server is RUNNING on :8202** (tmux session `server`). Smoke test posted 3 rounds of synthetic frames and the model returned `(30, 14)` finite action tensors. Full pipeline verified on RTX 5090 / Blackwell sm_120.
+- ✅ Model weights `allenai/MolmoAct2-BimanualYAM` (21 GB on disk) cached at `molmoact2-setup/hf-cache/`
 - ✅ Two launcher scripts ready: `scripts/run_server.sh` and `scripts/run_client.sh`
 - ✅ Client bridge `scripts/yam_client.py` written — handles 2 YAM follower arms + 3 RealSense cameras, polls the server, applies clipped joint commands
+- ✅ Pre-flight checker `scripts/preflight.py`, camera enumerator `scripts/list_cams.py`, frame capture `scripts/capture_frames.py`, server smoke test `scripts/smoke_test_server.py`
 - ✅ i2rt SDK sim path verified (7-DoF YAM in mujoco moves)
+- ✅ Blackwell sm_120 verified: torch 2.5.1+cu121 → `no kernel image is available`, bumped to torch 2.8.0+cu128 → bf16 matmul + full model inference work cleanly.
+
+### Smoke-test numbers (synthetic input, RTX 5090, bf16, --cuda-graph)
+
+| Round | Server `dt_ms` | Notes |
+|---|---|---|
+| 0 (warmup) | 791 ms | CUDA graph captured on first real-shape request |
+| 1 | 346 ms | steady-state |
+| 2 | 331 ms | steady-state |
+
+Action shape returned: **`(30, 14)`** — 30-step horizon, 14-D actions matching state layout. Max-abs delta of first step on synthetic input was 0.7–0.9 rad — *why the client's per-tick clip (default 0.05 rad) really matters*; the policy expects you to play out the horizon, not apply step 0 directly.
 
 **You still need to do, on return:**
 1. Plug in the second YAM arm (`can1` had zero CAN traffic — only one arm online during my probe).
@@ -97,9 +109,11 @@ curl http://127.0.0.1:8202/act
     --top-cam-serial   XXXX \
     --left-cam-serial  YYYY \
     --right-cam-serial ZZZZ \
-    --rate-hz 5 \
+    --train-fps 30 \
+    --horizon-stride 6 \
     --max-step-rad 0.05 \
-    --gripper-step 0.05
+    --gripper-step 0.05 \
+    --dry-run                    # remove this once actions look sane
 ```
 
 **Strongly recommended first run:** add `--dry-run` to `run_client.sh`. The client will read state, query the model, and print the actions without commanding the arms. Verify the actions look sane before removing `--dry-run`.
@@ -189,6 +203,9 @@ Williamtsai726/YAM is the reference bimanual YAM impl Ai2 used:
 
 (Newest first.)
 
+- T+75m — **Server up and smoke test PASS.** Started inference server in tmux `server`, posted synthetic frames via `scripts/smoke_test_server.py`. Returned (30, 14) actions, server dt ~330ms steady-state. Pipeline confirmed working on RTX 5090/Blackwell.
+- T+60m — HF download complete (21 GB on disk, 5 shards). einops dep missing → added, re-synced.
+- T+50m — Disk pressure observed (99% full at peak); cleared OK after dedupe.
 - T+45m — Tasks 1–5, 8, 9 complete. Client + launchers committed (local). HF download ~20% complete. Report at v2.
 - T+30m — Wrote `scripts/yam_client.py` (full client loop with safety caps). Wrote launcher shell scripts.
 - T+25m — Added `pyrealsense2`, `json-numpy`, `requests` to i2rt venv. Sim YAM smoke test passed.
