@@ -47,7 +47,8 @@ log = logging.getLogger("yam.client")
 # Tuned conservatively — increase only after the policy looks safe.
 DEFAULT_MAX_STEP_RAD = 0.05
 DEFAULT_GRIPPER_STEP = 0.05
-DEFAULT_RATE_HZ = 5.0
+DEFAULT_TRAIN_FPS = 30.0   # the policy's training cadence — controls inner-loop pace
+DEFAULT_HORIZON_STRIDE = 6 # play this many steps from each (30, 14) horizon before re-querying
 STATE_DIM = 14   # per-arm 7-D × 2
 ARM_DOFS = 7     # 6 arm joints + 1 gripper
 
@@ -188,16 +189,17 @@ def main() -> None:
                    help="MolmoAct2 server /act endpoint")
     p.add_argument("--instruction", required=True,
                    help="Natural-language task; e.g. 'first pick up the left orange cube and put it in the box, then pick up the right orange cube and put it in the box'")
-    p.add_argument("--rate-hz", type=float, default=DEFAULT_RATE_HZ,
-                   help="Control rate")
+    p.add_argument("--train-fps", type=float, default=DEFAULT_TRAIN_FPS,
+                   help="Policy training cadence — inner loop sleeps 1/train_fps between commands")
     p.add_argument("--num-steps", type=int, default=10,
                    help="Flow-matching steps (server-side)")
     p.add_argument("--max-step-rad", type=float, default=DEFAULT_MAX_STEP_RAD,
                    help="Per-joint per-tick clip (rad)")
     p.add_argument("--gripper-step", type=float, default=DEFAULT_GRIPPER_STEP,
                    help="Gripper per-tick clip (normalized units)")
-    p.add_argument("--horizon-stride", type=int, default=1,
-                   help="Apply every Nth action from the returned horizon before re-querying")
+    p.add_argument("--horizon-stride", type=int, default=DEFAULT_HORIZON_STRIDE,
+                   help="Apply this many steps from each returned horizon before re-querying. "
+                        "With train_fps=30 and stride=6, server is queried 5 Hz.")
     p.add_argument("--timeout-s", type=float, default=5.0,
                    help="HTTP timeout per /act call")
     p.add_argument("--dry-run", action="store_true",
@@ -233,14 +235,13 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _sigint)
 
-    dt_target = 1.0 / args.rate_hz
-    log.info("Entering control loop at %.1f Hz, instruction=%r", args.rate_hz, args.instruction)
+    inner_dt = 1.0 / args.train_fps
+    log.info("Entering control loop: train_fps=%.1f Hz, stride=%d (re-query ~%.1f Hz), instruction=%r",
+             args.train_fps, args.horizon_stride, args.train_fps / max(1, args.horizon_stride), args.instruction)
     log.info("Per-tick caps: arm=%.3f rad, gripper=%.3f", args.max_step_rad, args.gripper_step)
 
     try:
         while not stop_flag["stop"]:
-            tick_start = time.perf_counter()
-
             state = read_state(left, right)
             top_img = top.grab()
             left_img = cam_l.grab()
@@ -251,28 +252,27 @@ def main() -> None:
                 args.instruction, args.num_steps, args.timeout_s,
             )
 
-            # The policy returns a horizon of N actions; apply the next one,
-            # then re-query (horizon-stride controls how many we play out per
-            # request — keeping it at 1 = full closed-loop).
             stride = max(1, args.horizon_stride)
-            for i in range(min(stride, actions.shape[0])):
+            n_to_play = min(stride, actions.shape[0])
+            for i in range(n_to_play):
                 if stop_flag["stop"]:
                     break
+                step_start = time.perf_counter()
                 desired = actions[i].astype(np.float32)
                 if args.dry_run:
-                    log.info("dry-run action[%d]: %s", i, np.array2string(desired, precision=3))
+                    log.info("dry-run action[%d]: %s", i,
+                             np.array2string(desired, precision=3))
                 else:
-                    safe_command(left, right, state, desired, args.max_step_rad, args.gripper_step)
-                    # update state estimate for next intra-horizon command
                     state = read_state(left, right)
-
-            elapsed = time.perf_counter() - tick_start
-            sleep_left = dt_target - elapsed
-            if sleep_left > 0:
-                time.sleep(sleep_left)
-            else:
-                log.warning("tick overrun by %.1f ms (target %.1f ms)",
-                            -sleep_left * 1000.0, dt_target * 1000.0)
+                    safe_command(left, right, state, desired,
+                                 args.max_step_rad, args.gripper_step)
+                # Pace inner loop at the policy's training cadence.
+                sleep_left = inner_dt - (time.perf_counter() - step_start)
+                if sleep_left > 0:
+                    time.sleep(sleep_left)
+                elif sleep_left < -0.005:
+                    log.warning("inner step overrun by %.1f ms (target %.1f ms)",
+                                -sleep_left * 1000.0, inner_dt * 1000.0)
     finally:
         log.info("Stopping cameras")
         for c in (top, cam_l, cam_r):
