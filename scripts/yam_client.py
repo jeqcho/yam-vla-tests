@@ -289,8 +289,13 @@ def main() -> None:
     p.add_argument("--horizon-stride", type=int, default=DEFAULT_HORIZON_STRIDE,
                    help="Apply this many steps from each returned horizon before re-querying. "
                         "With train_fps=30 and stride=6, server is queried 5 Hz.")
-    p.add_argument("--timeout-s", type=float, default=5.0,
-                   help="HTTP timeout per /act call")
+    p.add_argument("--timeout-s", type=float, default=15.0,
+                   help="HTTP timeout per /act call (steady state). The first call after the server "
+                        "comes up may take >5s because the model re-captures CUDA graphs for the "
+                        "client's specific image shape; the script's explicit warmup uses a longer "
+                        "timeout of its own.")
+    p.add_argument("--warmup-timeout-s", type=float, default=60.0,
+                   help="HTTP timeout for the one-shot warmup call. Bump if the server is loading.")
     p.add_argument("--dry-run", action="store_true",
                    help="Don't command the arms; print actions only")
     args = p.parse_args()
@@ -333,6 +338,22 @@ def main() -> None:
              "(ideal re-query ~%.1f Hz; actual is lower by ~server dt_ms), instruction=%r",
              args.train_fps, args.horizon_stride, ideal_query_hz, args.instruction)
     log.info("Per-tick caps: arm=%.3f rad, gripper=%.3f", args.max_step_rad, args.gripper_step)
+
+    # Warmup the server with one /act call at the actual image shape so it
+    # captures CUDA graphs once with a generous timeout, before the real
+    # closed-loop control begins.
+    try:
+        state = read_state(left, right)
+        log.info("Warming up server with a one-shot call at the real image shape "
+                 "(timeout=%.0fs)...", args.warmup_timeout_s)
+        _wu_actions, _wu_rtt = post_actions(
+            args.server_url, top.grab(), cam_l.grab(), cam_r.grab(), state,
+            args.instruction, args.num_steps, args.warmup_timeout_s,
+        )
+        log.info("Server warmup OK (rtt=%.0f ms, actions shape=%s)",
+                 _wu_rtt, _wu_actions.shape)
+    except Exception as e:
+        log.error("Server warmup failed: %s. Continuing anyway.", e)
 
     try:
         while not stop_flag["stop"]:
