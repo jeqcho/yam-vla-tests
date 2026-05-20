@@ -35,7 +35,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Iterator
 
 import numpy as np
@@ -48,15 +47,17 @@ COMM_ERR_RE = re.compile(
 )
 
 
-@dataclass
 class ErrorCounter(logging.Handler):
-    """Logging handler that increments per-channel comm-error counts."""
-    counts: dict | None = None
+    """Logging handler that increments per-channel comm-error counts.
 
-    def __post_init__(self):
+    Plain class -- not a dataclass -- because logging.Handler.__init__ puts
+    `self` in a weakset that requires hashability, and @dataclass kills the
+    default identity __hash__.
+    """
+
+    def __init__(self) -> None:
         super().__init__(level=logging.ERROR)
-        if self.counts is None:
-            self.counts = {}
+        self.counts: dict[str, int] = {}
 
     def emit(self, record: logging.LogRecord) -> None:
         m = COMM_ERR_RE.search(record.getMessage())
