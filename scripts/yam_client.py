@@ -13,7 +13,8 @@ Run with the i2rt venv:
 
 Safety: every command is clipped to within --max-step-rad of the current state
 per arm joint, and the gripper is clipped to --gripper-step per step. Ctrl+C
-sends both arms to gravity-comp mode and exits.
+stops the loop and exits; the arms hold their last commanded position — kill
+power if that pose isn't safe.
 """
 from __future__ import annotations
 
@@ -236,8 +237,10 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sigint)
 
     inner_dt = 1.0 / args.train_fps
-    log.info("Entering control loop: train_fps=%.1f Hz, stride=%d (re-query ~%.1f Hz), instruction=%r",
-             args.train_fps, args.horizon_stride, args.train_fps / max(1, args.horizon_stride), args.instruction)
+    ideal_query_hz = args.train_fps / max(1, args.horizon_stride)
+    log.info("Entering control loop: train_fps=%.1f Hz, stride=%d "
+             "(ideal re-query ~%.1f Hz; actual is lower by ~server dt_ms), instruction=%r",
+             args.train_fps, args.horizon_stride, ideal_query_hz, args.instruction)
     log.info("Per-tick caps: arm=%.3f rad, gripper=%.3f", args.max_step_rad, args.gripper_step)
 
     try:
