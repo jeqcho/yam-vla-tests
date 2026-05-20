@@ -25,6 +25,46 @@ smoke test PASS
 
 Action horizon is **30 steps × 14-D**, matching `norm_stats.json["yam_dual_molmoact2"]["action_horizon"] = 30`. Steady-state server inference ~330 ms; with the default `--horizon-stride 6` and `--train-fps 30`, the effective server-query rate is ~1.9 Hz while arm commands flow at 30 Hz between queries.
 
+## Running vanilla MolmoAct2 in addition to BimanualYAM
+
+The vanilla `allenai/MolmoAct2` foundation model ships norm metadata for **seven** embodiments (`franka_droid`, `so100_so101_molmoact2`, `widowx_bridge`, `google_robot_fractal`, `franka_molmoact`, `google_robot_bc_z`, **`yam_dual_molmoact2`**). The YAM tag has identical `state_dim=14`, `action_horizon=30`, and 3-camera schema. So the existing `host_server_yam.py` works against vanilla MolmoAct2 unchanged — just pass `--repo-id allenai/MolmoAct2`. `scripts/run_server_base.sh` wraps this and binds to port **8302** (vs 8202 for BimanualYAM) so you can curl both in the same shell and tell them apart.
+
+> ⚠️ **Vanilla is a foundation checkpoint**, explicitly intended for further fine-tuning rather than direct deployment ("This model card intentionally does not include direct policy inference code"). Expect worse zero-shot orange-cube performance than the fine-tuned BimanualYAM. Side-by-side comparison is still useful as a baseline.
+
+> ⚠️ **Disk constraint.** `df -h /` shows ~2.3 GB free at the time of writing. Vanilla MolmoAct2 weights are ~22 GB. Free space (`Documents/` is 168 GB, `forecasting-physical-automation/` is 126 GB, `andon/` is 79 GB) or point `HF_HOME` at a different mount before running:
+> ```bash
+> # one-shot download into the same hf-cache once disk is freed
+> cd /home/andon/yam-tests/molmoact2-setup
+> export HF_HUB_ENABLE_HF_TRANSFER=1
+> export HF_HOME="$PWD/hf-cache"
+> uv run hf download allenai/MolmoAct2
+> # then stop BimanualYAM, start vanilla
+> tmux kill-session -t server
+> tmux new -d -s server-base "./scripts/run_server_base.sh 2>&1 | tee logs/server_base.log"
+> curl http://127.0.0.1:8302/act
+> ```
+
+> Both servers can't fit on the GPU simultaneously (each holds ~16 GB bf16 + cuda graphs), so stop one before starting the other.
+
+### Inference best-practice audit (vs the BimanualYAM model card)
+
+Our server matches the example call in the model card exactly:
+
+| Param | Model card | `host_server_yam.py:198–210` |
+|---|---|---|
+| `norm_tag` | `"yam_dual_molmoact2"` | ✅ |
+| `inference_action_mode` | `"continuous"` (required, no default) | ✅ explicit |
+| `num_steps` | `10` (default `config.flow_matching_num_steps`) | ✅ |
+| `normalize_language` | `True` (lowercases + strips trailing punct) | ✅ |
+| `enable_cuda_graph` | `True` | ✅ via `--cuda-graph` |
+| Camera order | `[top, left, right]` | ✅ enforced |
+| State scale | gripper in `[0, 1]` normalized | ✅ via i2rt SDK |
+
+Two card-recommended things to verify on first deployment:
+
+- *"Run several random warm-up calls before measuring deployment latency."* The server does one warmup at startup. `scripts/smoke_test_server.py` adds 3 more rounds — run that once after the server starts and CUDA graphs will be fully captured for the typical input shape.
+- The model accepts arbitrary image resolutions (SigLIP-tile-based image processor), but Ai2's training data was at `256×342`. RealSense frames at 640×480 will resize internally — fine, but matching the training distribution by resizing client-side may improve sample efficiency. Worth A/B-ing later. For now we send raw RGB.
+
 ## You still need to do on return
 
 1. **Plug in the second YAM arm.** `can1` had zero packets ever — only one arm was online when I probed. The bimanual policy is 14-D and won't work unimanual.
@@ -32,7 +72,7 @@ Action horizon is **30 steps × 14-D**, matching `norm_stats.json["yam_dual_molm
 3. **Install librealsense udev rules.** The `pyrealsense2` pip wheel does NOT install them; without them, non-root `rs.context().query_devices()` returns 0 even with cameras plugged in. Drop `99-realsense-libusb.rules` from `IntelRealSense/librealsense` into `/etc/udev/rules.d/`, then `sudo udevadm control --reload-rules && sudo udevadm trigger`.
 4. **Verify gripper variant per arm** — pictures sent earlier (`linear_4310` / `linear_3507` / `crank_4310` / `flexible_4310`); pass via `--left-gripper`/`--right-gripper`.
 5. **`gh auth login`** — no GitHub auth means I couldn't push the `molmoact2-setup/` repo. Locally committed only.
-6. **Decide which CAN bus is left vs right** — see "State + left/right convention" below.
+6. **Decide which CAN bus is left vs right.** `can0 ↔ usb 3-9.1`, `can1 ↔ usb 3-9.3` (unchanged across your USB swap — counters stayed at 0 packets, so we can't disambiguate passively). To identify physically: `scripts/identify_arms.py --can-a can0 --can-b can1` initializes both arms in zero-torque mode with auto-cal disabled (no gripper movement), drops them into zero-torque mode so motors don't hold position, and streams joint readings. Hold each arm so it doesn't sag, wiggle one, and read off which CAN bus shows joint deltas. See also "State + left/right convention" below.
 
 ## Hardware survey (snapshot, T+0)
 
