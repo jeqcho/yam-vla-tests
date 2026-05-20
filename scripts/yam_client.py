@@ -1,0 +1,287 @@
+"""Bimanual YAM client for the MolmoAct2-BimanualYAM inference server.
+
+Wire-format reference: examples/yam/host_server_yam.py in allenai/molmoact2.
+Run with the i2rt venv:
+
+    /home/andon/yam-tests/i2rt/.venv/bin/python scripts/yam_client.py \\
+        --left-can can0 --right-can can1 \\
+        --left-gripper linear_4310 --right-gripper linear_4310 \\
+        --top-cam-serial AAAA --left-cam-serial BBBB --right-cam-serial CCCC \\
+        --server-url http://127.0.0.1:8202/act \\
+        --instruction "first pick up the left orange cube and put it in the box, then pick up the right orange cube and put it in the box" \\
+        --rate-hz 5 --max-step-rad 0.05 --gripper-step 0.05
+
+Safety: every command is clipped to within --max-step-rad of the current state
+per arm joint, and the gripper is clipped to --gripper-step per step. Ctrl+C
+sends both arms to gravity-comp mode and exits.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import json_numpy
+import numpy as np
+import requests
+
+# i2rt imports — provided by the i2rt venv (/home/andon/yam-tests/i2rt/.venv).
+from i2rt.robots.get_robot import get_yam_robot
+from i2rt.robots.robot import Robot
+from i2rt.robots.utils import ArmType, GripperType
+
+json_numpy.patch()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("yam.client")
+
+
+# Default per-step caps (radians for joints, normalized for gripper).
+# Tuned conservatively — increase only after the policy looks safe.
+DEFAULT_MAX_STEP_RAD = 0.05
+DEFAULT_GRIPPER_STEP = 0.05
+DEFAULT_RATE_HZ = 5.0
+STATE_DIM = 14   # per-arm 7-D × 2
+ARM_DOFS = 7     # 6 arm joints + 1 gripper
+
+
+@dataclass
+class CameraStream:
+    """One RealSense color stream. Cached frame is the latest grab."""
+    serial: str
+    name: str
+    width: int = 640
+    height: int = 480
+    fps: int = 30
+    pipeline: object = None  # rs.pipeline at runtime
+
+    def start(self) -> None:
+        import pyrealsense2 as rs
+        cfg = rs.config()
+        cfg.enable_device(self.serial)
+        cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
+        self.pipeline = rs.pipeline()
+        self.pipeline.start(cfg)
+        log.info("camera %s (%s) started @ %dx%d/%d Hz", self.name, self.serial,
+                 self.width, self.height, self.fps)
+
+    def grab(self) -> np.ndarray:
+        """Return an HxWx3 uint8 RGB image. Blocks briefly waiting for a frame."""
+        frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+        color = frames.get_color_frame()
+        if not color:
+            raise RuntimeError(f"camera {self.name} produced no color frame")
+        return np.asanyarray(color.get_data())
+
+    def stop(self) -> None:
+        if self.pipeline is not None:
+            self.pipeline.stop()
+
+
+def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None) -> Robot:
+    """Create a YAM follower robot. No teaching handle — MolmoAct2 is the leader."""
+    arm_type = ArmType.from_string_name("yam")
+    gripper_type = GripperType.from_string_name(gripper)
+    log.info("Initializing arm on %s with gripper=%s", can_channel, gripper)
+    return get_yam_robot(
+        channel=can_channel,
+        arm_type=arm_type,
+        gripper_type=gripper_type,
+        zero_gravity_mode=True,   # start in gravity-comp; we'll command after first /act reply
+        ee_mass=ee_mass,
+    )
+
+
+def read_state(left: Robot, right: Robot) -> np.ndarray:
+    """Compose the 14-D state vector: [left_q6+grip, right_q6+grip]."""
+    s_l = np.asarray(left.get_joint_pos(), dtype=np.float32).reshape(-1)
+    s_r = np.asarray(right.get_joint_pos(), dtype=np.float32).reshape(-1)
+    if s_l.shape != (ARM_DOFS,) or s_r.shape != (ARM_DOFS,):
+        raise RuntimeError(
+            f"expected ({ARM_DOFS},) per arm, got left={s_l.shape}, right={s_r.shape}"
+        )
+    return np.concatenate([s_l, s_r], axis=0).astype(np.float32)
+
+
+def safe_command(
+    left: Robot,
+    right: Robot,
+    current_state: np.ndarray,
+    desired_action: np.ndarray,
+    max_step_rad: float,
+    gripper_step: float,
+) -> np.ndarray:
+    """Clip the desired action so each joint moves at most max_step_rad from
+    the current state in this tick. Returns the actually applied command.
+    """
+    if desired_action.shape != (STATE_DIM,):
+        raise ValueError(f"action shape {desired_action.shape} != ({STATE_DIM},)")
+    delta = desired_action - current_state
+    # Per-arm caps: indices 0..5 + 7..12 are arm joints, 6 + 13 are grippers.
+    caps = np.full(STATE_DIM, max_step_rad, dtype=np.float32)
+    caps[6] = gripper_step
+    caps[13] = gripper_step
+    clipped_delta = np.clip(delta, -caps, caps)
+    cmd = (current_state + clipped_delta).astype(np.float32)
+    left.command_joint_pos(cmd[:ARM_DOFS])
+    right.command_joint_pos(cmd[ARM_DOFS:])
+    return cmd
+
+
+def post_actions(
+    server_url: str,
+    top: np.ndarray,
+    left_img: np.ndarray,
+    right_img: np.ndarray,
+    state: np.ndarray,
+    instruction: str,
+    num_steps: int,
+    timeout_s: float,
+) -> tuple[np.ndarray, float]:
+    """Round-trip one /act call. Returns (actions[N, D], dt_ms)."""
+    payload = {
+        "top_cam": top,
+        "left_cam": left_img,
+        "right_cam": right_img,
+        "instruction": instruction,
+        "state": state,
+        "num_steps": num_steps,
+        "timestamp": time.time(),
+    }
+    body = json_numpy.dumps(payload)
+    t0 = time.perf_counter()
+    resp = requests.post(server_url, data=body, headers={"Content-Type": "application/json"},
+                         timeout=timeout_s)
+    resp.raise_for_status()
+    out = json_numpy.loads(resp.text)
+    if "actions" not in out:
+        raise RuntimeError(f"server response missing 'actions': keys={list(out.keys())}")
+    actions = np.asarray(out["actions"], dtype=np.float32)
+    server_dt_ms = float(out.get("dt_ms", 0.0))
+    rtt_ms = (time.perf_counter() - t0) * 1000.0
+    log.debug("server dt=%.1f ms, rtt=%.1f ms, actions shape=%s",
+              server_dt_ms, rtt_ms, actions.shape)
+    return actions, rtt_ms
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="MolmoAct2-BimanualYAM client")
+    p.add_argument("--left-can", default="can0", help="CAN channel for the LEFT arm")
+    p.add_argument("--right-can", default="can1", help="CAN channel for the RIGHT arm")
+    p.add_argument("--left-gripper", default="linear_4310",
+                   choices=["crank_4310", "linear_3507", "linear_4310", "flexible_4310"],
+                   help="Gripper type on the left arm")
+    p.add_argument("--right-gripper", default="linear_4310",
+                   choices=["crank_4310", "linear_3507", "linear_4310", "flexible_4310"],
+                   help="Gripper type on the right arm")
+    p.add_argument("--top-cam-serial", required=True, help="RealSense D435 (overhead)")
+    p.add_argument("--left-cam-serial", required=True, help="RealSense D405 on/near left arm")
+    p.add_argument("--right-cam-serial", required=True, help="RealSense D405 on/near right arm")
+    p.add_argument("--server-url", default="http://127.0.0.1:8202/act",
+                   help="MolmoAct2 server /act endpoint")
+    p.add_argument("--instruction", required=True,
+                   help="Natural-language task; e.g. 'first pick up the left orange cube and put it in the box, then pick up the right orange cube and put it in the box'")
+    p.add_argument("--rate-hz", type=float, default=DEFAULT_RATE_HZ,
+                   help="Control rate")
+    p.add_argument("--num-steps", type=int, default=10,
+                   help="Flow-matching steps (server-side)")
+    p.add_argument("--max-step-rad", type=float, default=DEFAULT_MAX_STEP_RAD,
+                   help="Per-joint per-tick clip (rad)")
+    p.add_argument("--gripper-step", type=float, default=DEFAULT_GRIPPER_STEP,
+                   help="Gripper per-tick clip (normalized units)")
+    p.add_argument("--horizon-stride", type=int, default=1,
+                   help="Apply every Nth action from the returned horizon before re-querying")
+    p.add_argument("--timeout-s", type=float, default=5.0,
+                   help="HTTP timeout per /act call")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Don't command the arms; print actions only")
+    args = p.parse_args()
+
+    # Health-check the server first so we fail fast.
+    health_url = args.server_url.rstrip("/").rsplit("/", 1)[0] + "/act" if args.server_url.endswith("/act") else args.server_url
+    try:
+        r = requests.get(health_url, timeout=3.0)
+        r.raise_for_status()
+        log.info("server health: %s", r.json())
+    except Exception as e:
+        log.error("server health check failed at %s: %s", health_url, e)
+        sys.exit(2)
+
+    # Init arms first (will fail loud if CAN/hardware is wrong).
+    left = init_arm(args.left_can, args.left_gripper)
+    right = init_arm(args.right_can, args.right_gripper)
+
+    # Cameras.
+    top = CameraStream(args.top_cam_serial, "top")
+    cam_l = CameraStream(args.left_cam_serial, "left")
+    cam_r = CameraStream(args.right_cam_serial, "right")
+    for c in (top, cam_l, cam_r):
+        c.start()
+
+    stop_flag = {"stop": False}
+
+    def _sigint(_sig, _frame):
+        log.info("SIGINT received, stopping after current tick")
+        stop_flag["stop"] = True
+
+    signal.signal(signal.SIGINT, _sigint)
+
+    dt_target = 1.0 / args.rate_hz
+    log.info("Entering control loop at %.1f Hz, instruction=%r", args.rate_hz, args.instruction)
+    log.info("Per-tick caps: arm=%.3f rad, gripper=%.3f", args.max_step_rad, args.gripper_step)
+
+    try:
+        while not stop_flag["stop"]:
+            tick_start = time.perf_counter()
+
+            state = read_state(left, right)
+            top_img = top.grab()
+            left_img = cam_l.grab()
+            right_img = cam_r.grab()
+
+            actions, rtt_ms = post_actions(
+                args.server_url, top_img, left_img, right_img, state,
+                args.instruction, args.num_steps, args.timeout_s,
+            )
+
+            # The policy returns a horizon of N actions; apply the next one,
+            # then re-query (horizon-stride controls how many we play out per
+            # request — keeping it at 1 = full closed-loop).
+            stride = max(1, args.horizon_stride)
+            for i in range(min(stride, actions.shape[0])):
+                if stop_flag["stop"]:
+                    break
+                desired = actions[i].astype(np.float32)
+                if args.dry_run:
+                    log.info("dry-run action[%d]: %s", i, np.array2string(desired, precision=3))
+                else:
+                    safe_command(left, right, state, desired, args.max_step_rad, args.gripper_step)
+                    # update state estimate for next intra-horizon command
+                    state = read_state(left, right)
+
+            elapsed = time.perf_counter() - tick_start
+            sleep_left = dt_target - elapsed
+            if sleep_left > 0:
+                time.sleep(sleep_left)
+            else:
+                log.warning("tick overrun by %.1f ms (target %.1f ms)",
+                            -sleep_left * 1000.0, dt_target * 1000.0)
+    finally:
+        log.info("Stopping cameras")
+        for c in (top, cam_l, cam_r):
+            try:
+                c.stop()
+            except Exception:
+                pass
+        log.info("Arms left in their last commanded position — kill power if not safe.")
+
+
+if __name__ == "__main__":
+    main()
