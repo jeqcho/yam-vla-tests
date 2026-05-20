@@ -9,7 +9,7 @@ Run with the i2rt venv:
         --top-cam-serial AAAA --left-cam-serial BBBB --right-cam-serial CCCC \\
         --server-url http://127.0.0.1:8202/act \\
         --instruction "first pick up the left orange cube and put it in the box, then pick up the right orange cube and put it in the box" \\
-        --rate-hz 5 --max-step-rad 0.05 --gripper-step 0.05
+        --train-fps 30 --horizon-stride 6 --max-step-rad 0.05 --gripper-step 0.05
 
 Safety: every command is clipped to within --max-step-rad of the current state
 per arm joint, and the gripper is clipped to --gripper-step per step. Ctrl+C
