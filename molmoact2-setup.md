@@ -152,7 +152,18 @@ state[7..12]  right arm joints (q0..q5)
 state[13]     right gripper
 ```
 
-**Verify on first dry-run** that the i2rt SDK's `get_joint_pos()` returns this exact layout per arm. If the gripper isn't index 6, the state vector is mis-shaped and the policy will refuse it or output garbage actions. The i2rt SDK's `MotorChainRobot` does return `(arm_joints..., gripper)` ordering — I confirmed via the SDK source — but worth a sanity check.
+**Verify on first dry-run** that the i2rt SDK's `get_joint_pos()` returns this exact layout per arm. If the gripper isn't index 6, the state vector is mis-shaped and the policy will refuse it or output garbage actions. The i2rt SDK's `MotorChainRobot` does return `(arm_joints..., gripper)` ordering — I confirmed via the SDK source at `i2rt/i2rt/robots/motor_chain_robot.py:504` — but worth a sanity check.
+
+**Gripper units (potential pitfall).** `get_joint_pos()` returns *all 7 values in radians*, including the gripper. The policy outputs gripper actions in whatever radian range it was trained on. MolmoAct2-BimanualYAM's Ai2 training rig used a specific gripper variant (likely `linear_4310` based on default factory shipments). If your gripper is different (`linear_3507`, `crank_4310`, `flexible_4310`), the radian range for "open" vs "closed" differs:
+
+| Gripper | "closed" rad | "open" rad |
+|---|---|---|
+| `linear_4310` | ~0.0 | ~stroke-dependent |
+| `linear_3507` | ~0.0 | ~stroke-dependent |
+| `crank_4310` | ~0.0 | ~-2.7 |
+| `flexible_4310` | ~0.0 | ~stroke-dependent |
+
+If grasping looks wrong (gripper never closes / closes too hard), the cause is almost certainly gripper-radian mismatch with training. Workaround: clamp the gripper channel of the action to your gripper's known limits, or fine-tune on a small dataset captured on *your* hardware. The Ai2 repo and `williamtsai726/YAM` ship a fine-tune workflow under `lerobot/` for exactly this.
 
 **Left vs right convention.** MolmoAct2-BimanualYAM was trained on a specific physical-arm-to-camera mapping. From the dataset paper and the camera order `[top, left, right]`, "left" and "right" are from the **operator's perspective looking at the workspace**. If you bias the wrong arm as "left", grasping behavior will mirror the wrong way. Verify by lifting one arm out of view in dry-run mode and checking which `left_cam` / `right_cam` it appears in.
 
