@@ -144,17 +144,29 @@ def make_camera(name: str, serial: Optional[str], v4l2_device: Optional[str]) ->
 
 
 def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None) -> Robot:
-    """Create a YAM follower robot. No teaching handle — MolmoAct2 is the leader."""
+    """Create a YAM follower robot in position-holding mode (kp != 0).
+
+    NOTE: this deliberately does NOT use the SDK's zero_gravity_mode. That mode
+    sets kp=0 and relies on gravity feedforward only; if gravity comp is even
+    slightly mis-tuned the arm drifts under gravity. We want the arm to actively
+    hold whatever pose it has when the script starts. command_joint_pos() then
+    drives it from there.
+    """
     arm_type = ArmType.from_string_name("yam")
     gripper_type = GripperType.from_string_name(gripper)
-    log.info("Initializing arm on %s with gripper=%s", can_channel, gripper)
-    return get_yam_robot(
+    log.info("Initializing arm on %s with gripper=%s (position-holding)", can_channel, gripper)
+    robot = get_yam_robot(
         channel=can_channel,
         arm_type=arm_type,
         gripper_type=gripper_type,
-        zero_gravity_mode=True,   # start in gravity-comp; we'll command after first /act reply
+        zero_gravity_mode=False,
         ee_mass=ee_mass,
     )
+    # Belt-and-braces: immediately command "hold at current pos" so even if
+    # the read-state -> first-command gap is large, the arm clamps to wherever
+    # it is right now rather than the read-then-drifted position.
+    robot.command_joint_pos(np.asarray(robot.get_joint_pos(), dtype=np.float32))
+    return robot
 
 
 def read_state(left: Robot, right: Robot) -> np.ndarray:
