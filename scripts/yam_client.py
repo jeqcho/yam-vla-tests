@@ -332,6 +332,8 @@ def main() -> None:
         sys.exit(2)
 
     # Init arms first (will fail loud if CAN/hardware is wrong).
+    left: Optional[Robot] = None
+    right: Optional[Robot] = None
     trace("about to init LEFT arm")
     left = init_arm(args.left_can, args.left_gripper)
     trace("about to init RIGHT arm")
@@ -351,13 +353,12 @@ def main() -> None:
         c.start()
         trace(f"camera {c.name} started")
 
-    stop_flag = {"stop": False}
-
-    def _sigint(_sig, _frame):
-        log.info("SIGINT received, stopping after current tick")
-        stop_flag["stop"] = True
-
-    signal.signal(signal.SIGINT, _sigint)
+    # Use Python's default SIGINT behavior (raises KeyboardInterrupt at the
+    # next interpreter checkpoint) rather than a custom handler that sets a
+    # flag. The custom-handler approach can leave non-daemon SDK threads alive
+    # after main() returns and the process won't exit; KeyboardInterrupt
+    # unwinds the stack faster and we force-exit at the bottom of finally.
+    stop_flag = {"stop": False}  # kept for backward compat with intra-loop checks
 
     inner_dt = 1.0 / args.train_fps
     ideal_query_hz = args.train_fps / max(1, args.horizon_stride)
@@ -412,17 +413,39 @@ def main() -> None:
                 sleep_left = inner_dt - (time.perf_counter() - step_start)
                 if sleep_left > 0:
                     time.sleep(sleep_left)
-                elif sleep_left < -0.005:
+                elif sleep_left < -0.050:
+                    # Only log severe overruns (>50ms = >1.5x the target tick).
+                    # Small overruns are USB-contention noise, harmless at our
+                    # arm command rates -- the motors lerp between sparser
+                    # position targets just fine.
                     log.warning("inner step overrun by %.1f ms (target %.1f ms)",
                                 -sleep_left * 1000.0, inner_dt * 1000.0)
+    except KeyboardInterrupt:
+        log.info("KeyboardInterrupt -- shutting down")
     finally:
         log.info("Stopping cameras")
         for c in (top, cam_l, cam_r):
             try:
                 c.stop()
-            except Exception:
-                pass
-        log.info("Arms left in their last commanded position — kill power if not safe.")
+            except Exception as e:
+                log.warning("camera %s stop failed: %s", c.name, e)
+        # Stop the i2rt SDK's per-arm background control threads. Without
+        # this, the process won't exit even after main() returns -- the
+        # control threads are non-daemon and Python waits on them forever.
+        log.info("Closing arm SDKs")
+        for arm in (left, right):
+            if arm is None:
+                continue
+            try:
+                arm.close()
+            except Exception as e:
+                log.warning("arm.close() failed: %s", e)
+        log.info("Arms left in their last commanded position -- kill power if not safe.")
+        # Force-exit: any thread that didn't honor close() (e.g. waiting on a
+        # CAN read in a C extension) won't keep the process alive.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
