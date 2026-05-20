@@ -37,11 +37,30 @@ from i2rt.robots.utils import ArmType, GripperType
 
 json_numpy.patch()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# Make stdout unbuffered so we can actually see where things hang.
+# i2rt's logger may have already called basicConfig at import time; force-add
+# our own StreamHandler so our messages always appear with timestamps.
+import os
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s | %(message)s"))
+_handler.setLevel(logging.INFO)
+# Avoid duplicate handlers if the module gets reloaded.
+if not any(getattr(h, "_yam_client_handler", False) for h in _root.handlers):
+    _handler._yam_client_handler = True
+    _root.addHandler(_handler)
+
 log = logging.getLogger("yam.client")
+
+
+def trace(msg: str) -> None:
+    """Always-flushed marker print so we see where the script is in real time."""
+    print(f"[TRACE] {msg}", flush=True)
 
 
 # Default per-step caps (radians for joints, normalized for gripper).
@@ -152,7 +171,8 @@ def make_camera(name: str, serial: Optional[str], v4l2_device: Optional[str],
     return V4L2Stream(v4l2_device, name, width=width, height=height, fps=fps)
 
 
-def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None) -> Robot:
+def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None) -> Robot:  # noqa: D401
+    trace(f"init_arm({can_channel}, {gripper}): entering get_yam_robot...")
     """Create a YAM follower robot in position-holding mode (kp != 0).
 
     NOTE: this deliberately does NOT use the SDK's zero_gravity_mode. That mode
@@ -163,7 +183,7 @@ def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None) ->
     """
     arm_type = ArmType.from_string_name("yam")
     gripper_type = GripperType.from_string_name(gripper)
-    log.info("Initializing arm on %s with gripper=%s (position-holding)", can_channel, gripper)
+    trace(f"init_arm({can_channel}): calling get_yam_robot (may take ~3-5s incl gripper auto-cal)")
     robot = get_yam_robot(
         channel=can_channel,
         arm_type=arm_type,
@@ -171,10 +191,11 @@ def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None) ->
         zero_gravity_mode=False,
         ee_mass=ee_mass,
     )
-    # Belt-and-braces: immediately command "hold at current pos" so even if
-    # the read-state -> first-command gap is large, the arm clamps to wherever
-    # it is right now rather than the read-then-drifted position.
-    robot.command_joint_pos(np.asarray(robot.get_joint_pos(), dtype=np.float32))
+    trace(f"init_arm({can_channel}): get_yam_robot returned, reading joint pos")
+    q0 = np.asarray(robot.get_joint_pos(), dtype=np.float32)
+    trace(f"init_arm({can_channel}): joint_pos={np.array2string(q0, precision=3)}, commanding hold")
+    robot.command_joint_pos(q0)
+    trace(f"init_arm({can_channel}): done")
     return robot
 
 
@@ -311,18 +332,24 @@ def main() -> None:
         sys.exit(2)
 
     # Init arms first (will fail loud if CAN/hardware is wrong).
+    trace("about to init LEFT arm")
     left = init_arm(args.left_can, args.left_gripper)
+    trace("about to init RIGHT arm")
     right = init_arm(args.right_can, args.right_gripper)
+    trace("both arms initialized")
 
     # Cameras — each slot can be RealSense or V4L2 independently. Resolution
     # applies to all three; the MolmoAct2 image processor tiles adaptively so
     # any reasonable size works (training was at 256x342).
     cam_kw = dict(width=args.cam_width, height=args.cam_height, fps=args.cam_fps)
+    trace(f"building cameras at {args.cam_width}x{args.cam_height}/{args.cam_fps}fps")
     top   = make_camera("top",   args.top_cam_serial,   args.top_cam_v4l2,   **cam_kw)
     cam_l = make_camera("left",  args.left_cam_serial,  args.left_cam_v4l2,  **cam_kw)
     cam_r = make_camera("right", args.right_cam_serial, args.right_cam_v4l2, **cam_kw)
     for c in (top, cam_l, cam_r):
+        trace(f"starting camera {c.name}")
         c.start()
+        trace(f"camera {c.name} started")
 
     stop_flag = {"stop": False}
 
