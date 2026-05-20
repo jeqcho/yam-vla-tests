@@ -1,135 +1,134 @@
 # MolmoAct2 on Bimanual YAM — Setup Report
 
-**Status: IN PROGRESS** (autonomously updated while you're at lunch)
 **Working directory:** `/home/andon/yam-tests/molmoact2-setup/`
 **Target task:** `"first pick up the left orange cube and put it in the box, then pick up the right orange cube and put it in the box"`
 
 ## Bottom line
 
-By the time you're back, this should be true:
-- ✅ **MolmoAct2 inference server is RUNNING on :8202** (tmux session `server`). Smoke test posted 3 rounds of synthetic frames and the model returned `(30, 14)` finite action tensors. Full pipeline verified on RTX 5090 / Blackwell sm_120.
+- ✅ **MolmoAct2 inference server is RUNNING on :8202** (tmux session `server`). Synthetic smoke test posted 3 rounds of fake frames; the model returned `(30, 14)` finite action tensors.
 - ✅ Model weights `allenai/MolmoAct2-BimanualYAM` (21 GB on disk) cached at `molmoact2-setup/hf-cache/`
-- ✅ Two launcher scripts ready: `scripts/run_server.sh` and `scripts/run_client.sh`
-- ✅ Client bridge `scripts/yam_client.py` written — handles 2 YAM follower arms + 3 RealSense cameras, polls the server, applies clipped joint commands
-- ✅ Pre-flight checker `scripts/preflight.py`, camera enumerator `scripts/list_cams.py`, frame capture `scripts/capture_frames.py`, server smoke test `scripts/smoke_test_server.py`
-- ✅ i2rt SDK sim path verified (7-DoF YAM in mujoco moves)
-- ✅ Blackwell sm_120 verified: torch 2.5.1+cu121 → `no kernel image is available`, bumped to torch 2.8.0+cu128 → bf16 matmul + full model inference work cleanly.
+- ✅ Launcher scripts: `scripts/run_server.sh`, `scripts/run_client.sh`
+- ✅ Client bridge `scripts/yam_client.py` — 2 YAM follower arms + 3 RealSense cameras, polls the server, applies per-tick-clipped joint commands
+- ✅ Utilities: `scripts/preflight.py`, `scripts/list_cams.py`, `scripts/capture_frames.py`, `scripts/smoke_test_server.py`
+- ✅ Blackwell sm_120 / RTX 5090: server runs cleanly on torch 2.8.0+cu128 (the Ai2-pinned cu121 wheels failed with `no kernel image is available`).
+- ✅ The legacy bf16 patches in `host_server_yam.py` log `needle not found` — that's expected on the YAM revision (fixed upstream); bf16 inference works regardless.
 
-### Smoke-test numbers (synthetic input, RTX 5090, bf16, --cuda-graph)
+### Smoke-test stdout (from `scripts/smoke_test_server.py`, T+75m)
 
-| Round | Server `dt_ms` | Notes |
-|---|---|---|
-| 0 (warmup) | 791 ms | CUDA graph captured on first real-shape request |
-| 1 | 346 ms | steady-state |
-| 2 | 331 ms | steady-state |
+```
+posting 3 round(s) of synthetic frames to http://127.0.0.1:8202/act
+  round 0: actions shape=(30, 14), |a-s|_max(first step)=0.945, server dt=791 ms, rtt=794 ms
+  round 1: actions shape=(30, 14), |a-s|_max(first step)=0.918, server dt=346 ms, rtt=349 ms
+  round 2: actions shape=(30, 14), |a-s|_max(first step)=0.742, server dt=331 ms, rtt=334 ms
+smoke test PASS
+```
 
-Action shape returned: **`(30, 14)`** — 30-step horizon, 14-D actions matching state layout. Max-abs delta of first step on synthetic input was 0.7–0.9 rad — *why the client's per-tick clip (default 0.05 rad) really matters*; the policy expects you to play out the horizon, not apply step 0 directly.
+Action horizon is **30 steps × 14-D**, matching `norm_stats.json["yam_dual_molmoact2"]["action_horizon"] = 30`. Steady-state server inference ~330 ms; with the default `--horizon-stride 6` and `--train-fps 30`, the effective server-query rate is ~1.9 Hz while arm commands flow at 30 Hz between queries.
 
-**You still need to do, on return:**
-1. Plug in the second YAM arm (`can1` had zero CAN traffic — only one arm online during my probe).
-2. Plug in 3 RealSense cameras (none detected on USB — `rs.context().query_devices()` returned 0 devices).
-3. `gh auth login` so I (or future-you) can `git push` the `molmoact2-setup/` repo.
-4. Identify your gripper variant per arm and pass it via `--left-gripper`/`--right-gripper`.
-5. Decide which CAN bus is left vs right (the policy's normalization assumes a specific convention from training data — see "Open questions" below).
+## You still need to do on return
+
+1. **Plug in the second YAM arm.** `can1` had zero packets ever — only one arm was online when I probed. The bimanual policy is 14-D and won't work unimanual.
+2. **Plug in 3 RealSense cameras** (D435 overhead + 2× D405) — none detected on USB.
+3. **Install librealsense udev rules.** The `pyrealsense2` pip wheel does NOT install them; without them, non-root `rs.context().query_devices()` returns 0 even with cameras plugged in. Drop `99-realsense-libusb.rules` from `IntelRealSense/librealsense` into `/etc/udev/rules.d/`, then `sudo udevadm control --reload-rules && sudo udevadm trigger`.
+4. **Verify gripper variant per arm** — pictures sent earlier (`linear_4310` / `linear_3507` / `crank_4310` / `flexible_4310`); pass via `--left-gripper`/`--right-gripper`.
+5. **`gh auth login`** — no GitHub auth means I couldn't push the `molmoact2-setup/` repo. Locally committed only.
+6. **Decide which CAN bus is left vs right** — see "State + left/right convention" below.
 
 ## Hardware survey (snapshot, T+0)
 
 | Thing | State |
 |---|---|
 | GPU | NVIDIA RTX 5090, 32 GB VRAM, driver 595.71.05 (CUDA 13.2) |
-| nvcc | 12.0.140 (cuda toolkit) |
-| Cores | (not checked) |
-| `can0` | UP @ 1 Mbit/s, parent `usb 3-9.1`, RX=2 / TX=2 packets (from earlier failed init) |
-| `can1` | UP @ 1 Mbit/s, parent `usb 3-9.3`, RX=0 / TX=0 packets — **silent, no arm responding yet** |
-| RealSense cameras | 0 detected on USB (`rs.context().query_devices()` empty) |
+| nvcc | 12.0.140 (not used at runtime; torch wheels ship their own CUDA libs) |
+| `can0` | UP @ 1 Mbit/s, parent `usb 3-9.1`, RX=2 / TX=2 packets (from earlier init attempts) |
+| `can1` | UP @ 1 Mbit/s, parent `usb 3-9.3`, **RX=0 / TX=0 packets** — no arm responding |
+| CAN persistence | `/etc/udev/rules.d/flow_base.rules` already installed — `can*` auto-up at 1 Mbit/s on plug-in. Survives reboot. |
+| RealSense cameras | **0 detected on USB.** No udev rules installed (see "still need to do" #3) |
 | i2rt SDK | installed in `/home/andon/yam-tests/i2rt/.venv` (python 3.11) |
 | mujoco | installed, sim YAM works end-to-end (7 DoFs read, gravity-comp OK) |
-| `pyrealsense2 2.57.7` | added to i2rt venv |
-| `json-numpy 2.1.1` | added to i2rt venv |
-| `requests` | already in i2rt venv |
-| `tmux` session `mact2` | running uv sync → HF download (~22 GB) |
+| Added to i2rt venv | `pyrealsense2 2.57.7`, `json-numpy 2.1.1`, `requests` |
+| `tmux` session `server` | inference server running, holds ~22 GB VRAM for the life of the session |
 
-### Blackwell (sm_120) caveat
-
-CLAUDE.md in `allenai/molmoact2` pins to `torch==2.5.1` + CUDA 12.1 (validated on A6000 = sm_86). RTX 5090 is sm_120. CUDA 12.1 wheels may not contain native sm_120 kernels and will rely on PTX JIT.
-
-**Plan if the server errors out on first launch with a CUDA arch error:**
-```bash
-cd /home/andon/yam-tests/molmoact2-setup
-# edit pyproject.toml -> change torch index to pytorch-cu124 (or cu128 from nightly)
-uv lock --upgrade-package torch
-uv sync
-```
-I left a note in `pyproject.toml`. If it Just Works on bf16, ignore this.
+Blackwell note: built against cu128 wheels (torch 2.8.0). No PTX-JIT fallback needed; bf16 matmul + full inference verified.
 
 ## Directory layout
 
 ```
 /home/andon/yam-tests/
-├── i2rt/                           # upstream i2rt-robotics/i2rt (DO NOT push)
-│   └── .venv/                      # i2rt SDK + mujoco + pyrealsense2 + json-numpy + requests
-├── molmoact2-setup/                # NEW — workspace (local git, no remote yet)
-│   ├── .venv/                      # torch 2.5.1+cu121, transformers 4.57, fastapi, etc
-│   ├── molmoact2/                  # clone of allenai/molmoact2 main
-│   ├── hf-cache/                   # MolmoAct2-BimanualYAM weights (~22 GB)
+├── i2rt/                              # upstream i2rt-robotics/i2rt (DO NOT push)
+│   └── .venv/                         # i2rt SDK + mujoco + pyrealsense2 + json-numpy + requests
+├── molmoact2-setup/                   # NEW — workspace (local git, no remote yet)
+│   ├── .venv/                         # torch 2.8.0+cu128, transformers 4.57.x, einops, fastapi
+│   ├── molmoact2/                     # clone of allenai/molmoact2 (main)
+│   ├── hf-cache/                      # MolmoAct2-BimanualYAM weights (21 GB)
 │   ├── scripts/
-│   │   ├── run_server.sh           # launches the MolmoAct2 FastAPI server (port 8202)
-│   │   ├── run_client.sh           # launches the YAM client with the orange-cube instruction
-│   │   └── yam_client.py           # client bridge — read state, snap cams, POST, command arms
-│   ├── logs/install.log            # tmux output for `uv sync` + `hf download`
-│   ├── pyproject.toml              # minimal — pinned to molmoact2 CLAUDE.md's validated stack
-│   └── .python-version             # 3.11
+│   │   ├── run_server.sh              # launches the FastAPI server (port 8202)
+│   │   ├── run_client.sh              # launches the YAM client with the orange-cube instruction
+│   │   ├── yam_client.py              # bimanual client loop
+│   │   ├── preflight.py               # cams + CAN + arms + server pre-flight
+│   │   ├── list_cams.py               # enumerate RealSense serials
+│   │   ├── capture_frames.py          # snap one frame per camera to PNG
+│   │   └── smoke_test_server.py       # post synthetic frames, verify (30, 14) actions
+│   ├── logs/{install.log,server.log}  # install + server tmux output
+│   ├── pyproject.toml                 # torch 2.8.0+cu128, transformers 4.57.x, einops, etc
+│   ├── uv.lock
+│   ├── HANDOFF.md                     # one-page bring-up checklist
+│   └── .python-version                # 3.11
 └── reports/
-    └── molmoact2-setup.md          # ← you are here
+    └── molmoact2-setup.md             # ← you are here
 ```
 
 ## How to run the orange-cube task
 
-After both arms are powered + connected, 3 RealSense cameras plugged in, and weights downloaded:
+The server is already up (`tmux attach -t server`). Steps below assume both arms + 3 cameras are connected and udev rules are installed.
 
 ```bash
-# Terminal 1 — start the server
-cd /home/andon/yam-tests/molmoact2-setup
-./scripts/run_server.sh
-
-# Wait until the warmup finishes (logs "Listening on 0.0.0.0:8202").
-
-# Terminal 2 — sanity check
+# 0. From a fresh shell — confirm the server is alive
 curl http://127.0.0.1:8202/act
 # Expect: {"status":"ok","repo_id":"allenai/MolmoAct2-BimanualYAM",
 #          "norm_tag":"yam_dual_molmoact2","num_cameras":3,"state_dim":14, ...}
 
-# Terminal 3 — connect to your arms
-# (need to fill in real camera serial numbers, see rs-enumerate-devices)
+# If it isn't running:
+cd /home/andon/yam-tests/molmoact2-setup
+tmux kill-session -t server 2>/dev/null
+tmux new -d -s server "./scripts/run_server.sh 2>&1 | tee logs/server.log"
+# Wait until logs/server.log shows "Listening on 0.0.0.0:8202" (~15 sec).
+
+# 1. Enumerate cameras (need serials for the client)
+/home/andon/yam-tests/i2rt/.venv/bin/python scripts/list_cams.py
+# Note the three serial numbers — physically inspect to confirm which is top/left/right.
+
+# 2. Pre-flight check. WARNING: this initialises both arms, which triggers
+#    auto-gripper-calibration on linear_4310 / linear_3507 / flexible_4310 —
+#    they will fully open and close. Clear the jaws first.
+/home/andon/yam-tests/i2rt/.venv/bin/python scripts/preflight.py \
+    --left-can can0 --right-can can1 \
+    --left-gripper linear_4310 --right-gripper linear_4310
+
+# 3. Dry-run the policy — NO arm movement
 ./scripts/run_client.sh \
-    --left-can can0 \
-    --right-can can1 \
-    --left-gripper linear_4310 \
-    --right-gripper linear_4310 \
+    --left-can can0 --right-can can1 \
+    --left-gripper linear_4310 --right-gripper linear_4310 \
     --top-cam-serial   XXXX \
     --left-cam-serial  YYYY \
     --right-cam-serial ZZZZ \
-    --train-fps 30 \
-    --horizon-stride 6 \
-    --max-step-rad 0.05 \
-    --gripper-step 0.05 \
-    --dry-run                    # remove this once actions look sane
+    --train-fps 30 --horizon-stride 6 \
+    --max-step-rad 0.05 --gripper-step 0.05 \
+    --dry-run
+
+# 4. If actions look sane, drop --dry-run.
 ```
 
-**Strongly recommended first run:** add `--dry-run` to `run_client.sh`. The client will read state, query the model, and print the actions without commanding the arms. Verify the actions look sane before removing `--dry-run`.
+### Server lifecycle
 
-To enumerate camera serials once they're plugged in:
-```bash
-/home/andon/yam-tests/i2rt/.venv/bin/python -c "
-import pyrealsense2 as rs
-for d in rs.context().query_devices():
-    print(d.get_info(rs.camera_info.name), '-', d.get_info(rs.camera_info.serial_number))
-"
-```
+- Holds ~22 GB VRAM for the life of the tmux session (no auto-release).
+- Doesn't need sudo.
+- Restart: `tmux kill-session -t server && tmux new -d -s server "./scripts/run_server.sh 2>&1 | tee logs/server.log"`
+- `HF_HOME=/home/andon/yam-tests/molmoact2-setup/hf-cache` is set inside `run_server.sh`. If you ever invoke `huggingface-cli` / `snapshot_download` directly without that env, weights will re-download to `~/.cache/huggingface`. Either always go through `run_server.sh`, or persist `HF_HOME` in `~/.bashrc`.
 
-## What the server/client expect (wire format)
+## Wire format
 
-From `examples/yam/host_server_yam.py` (Ai2's source of truth):
+From `examples/yam/host_server_yam.py` and `norm_stats.json`:
 
 **POST `/act` request (json_numpy):**
 
@@ -143,73 +142,58 @@ From `examples/yam/host_server_yam.py` (Ai2's source of truth):
 | `num_steps` | int (opt, 10) | flow-matching denoising steps |
 | `enable_cuda_graph` | bool (opt) | per-request override |
 
-**Response:** `{"actions": (N, D) float32, "dt_ms": float}` — N is the action horizon, D matches the state layout.
+**Response:** `{"actions": (30, 14) float32, "dt_ms": float}` — action horizon hardcoded at 30 per `norm_stats.json["yam_dual_molmoact2"]["action_horizon"]`.
 
-`norm_tag = "yam_dual_molmoact2"` — comes from `norm_stats.json` shipped in the HF snapshot, drives action de-normalization. Don't touch.
+`norm_tag = "yam_dual_molmoact2"` — drives action de-normalization.
+
+## State + left/right convention
+
+Per `norm_stats.json["yam_dual_molmoact2"]`:
+
+```
+state[0..5]   left arm joints (q0..q5)   radians   range: roughly the YAM joint limits
+state[6]      left gripper                [0, 1]   normalized (0 = closed, 1 = open)
+state[7..12]  right arm joints (q0..q5)  radians
+state[13]     right gripper               [0, 1]   normalized
+```
+
+The gripper is **[0, 1] normalized**, not radians. The i2rt SDK's `MotorChainRobot._motor_state_to_joint_state` (motor_chain_robot.py:457) normalizes the gripper to [0, 1] using `gripper_limits`. For `crank_4310`, limits are pre-set (`[0.0, -2.7]`). For `linear_4310` / `linear_3507` / `flexible_4310`, `gripper_limits` start `None` with `needs_calibration: True`, so the SDK runs `detect_gripper_limits()` at init — which drives the gripper to both end-stops to learn its range — and then normalizes thereafter.
+
+**Implication:** the first call to `preflight.py` or `run_client.sh` will physically open and close each gripper. Clear the jaws before running.
+
+`get_joint_pos()` returns `(7,)` per arm with the gripper already normalized — so `read_state()` in `yam_client.py` produces a `(14,)` vector matching the policy's expected layout directly. No manual normalization needed.
+
+**Left vs right.** "Left" and "right" are from the operator's POV looking at the workspace. Verify by running with `--dry-run`, lifting one arm out of view, and confirming which `left_cam` / `right_cam` it appears in. If swapped, exchange `--left-can` / `--right-can` (and the matching camera serials).
 
 ## Client safety
 
 `scripts/yam_client.py` defends against runaway commands:
 - Per-tick joint delta capped at `--max-step-rad` (default **0.05 rad ≈ 2.9°/tick**)
-- Gripper delta capped at `--gripper-step` (default **0.05** normalized units)
-- `--dry-run` mode prints actions without commanding
-- `SIGINT` (Ctrl+C) stops the loop and exits — arms hold their last position; **kill power if not safe**
+- Gripper delta capped at `--gripper-step` (default **0.05**, normalized units)
+- `--dry-run` prints actions without commanding
+- `SIGINT` (Ctrl+C) stops the loop and exits; arms hold their last position — **kill power if the pose isn't safe**
 
-Default rate 5 Hz to match MolmoAct2's training cadence (the policy returns a horizon, we currently consume just the first action and re-query — controlled by `--horizon-stride`).
+Why the per-tick clip matters: the smoke test showed first-step deltas of 0.7–0.9 rad on synthetic input. Without the clip, the arm would jerk hard at every server query. The policy expects you to play out the horizon (30 steps) at training cadence, not slam to step 0.
 
-## State vector layout (important — verify post-lunch)
+## Open questions for you
 
-```
-state[0..5]   left arm joints (q0..q5)   in radians, i2rt SDK convention
-state[6]      left gripper                normalized [0,1] (linear gripper) or radians (crank)
-state[7..12]  right arm joints (q0..q5)
-state[13]     right gripper
-```
-
-**Verify on first dry-run** that the i2rt SDK's `get_joint_pos()` returns this exact layout per arm. If the gripper isn't index 6, the state vector is mis-shaped and the policy will refuse it or output garbage actions. The i2rt SDK's `MotorChainRobot` does return `(arm_joints..., gripper)` ordering — I confirmed via the SDK source at `i2rt/i2rt/robots/motor_chain_robot.py:504` — but worth a sanity check.
-
-**Gripper units (potential pitfall).** `get_joint_pos()` returns *all 7 values in radians*, including the gripper. The policy outputs gripper actions in whatever radian range it was trained on. MolmoAct2-BimanualYAM's Ai2 training rig used a specific gripper variant (likely `linear_4310` based on default factory shipments). If your gripper is different (`linear_3507`, `crank_4310`, `flexible_4310`), the radian range for "open" vs "closed" differs:
-
-| Gripper | "closed" rad | "open" rad |
-|---|---|---|
-| `linear_4310` | ~0.0 | ~stroke-dependent |
-| `linear_3507` | ~0.0 | ~stroke-dependent |
-| `crank_4310` | ~0.0 | ~-2.7 |
-| `flexible_4310` | ~0.0 | ~stroke-dependent |
-
-If grasping looks wrong (gripper never closes / closes too hard), the cause is almost certainly gripper-radian mismatch with training. Workaround: clamp the gripper channel of the action to your gripper's known limits, or fine-tune on a small dataset captured on *your* hardware. The Ai2 repo and `williamtsai726/YAM` ship a fine-tune workflow under `lerobot/` for exactly this.
-
-**Left vs right convention.** MolmoAct2-BimanualYAM was trained on a specific physical-arm-to-camera mapping. From the dataset paper and the camera order `[top, left, right]`, "left" and "right" are from the **operator's perspective looking at the workspace**. If you bias the wrong arm as "left", grasping behavior will mirror the wrong way. Verify by lifting one arm out of view in dry-run mode and checking which `left_cam` / `right_cam` it appears in.
-
-## Reference impl
-
-Williamtsai726/YAM is the reference bimanual YAM impl Ai2 used:
-- `gello_software/` — teleop + data collection
-- `i2rt/` — same i2rt SDK (motor_id=7 is gripper, confirmed)
-- `lerobot/` — eval client (`experiments/molmoact.py:13` hardcodes the server URL)
-- Camera mapping in their training data: `{"left_camera_rgb": 'left', "right_camera_rgb": 'right', "front_camera_rgb": 'front'}` — **note their "front" likely corresponds to MolmoAct2's "top" in the inference-server schema. Verify before deploying.**
-- Their target resolution: `256 × 342` (not 640×480) — the server `_to_pil` should handle larger frames OK, but cropping during inference might matter for sim2real.
-- Their control rate: 30 Hz in training metadata, but inference at 5 Hz is fine.
-
-## Open questions / for you to answer
-
-1. **Gripper variant per arm.** Pictures sent earlier — pick `linear_4310` / `linear_3507` / `crank_4310` / `flexible_4310`. Most common factory default is `linear_4310`.
-2. **Camera mounting.** Have you mounted the D435 overhead and two D405s? Ai2's reference design pairs them with an extendable mount over a tabletop.
-3. **Workspace.** Where's the box, and within each arm's reach? Each YAM has ~700 mm reach.
-4. **Push remote.** I can't `git push` — `gh auth status` says no auth. The `molmoact2-setup/` repo is local-only. After `gh auth login`, run `gh repo create yam-molmoact2 --source=/home/andon/yam-tests/molmoact2-setup --private --push`.
-5. **One arm or two?** `can1` has zero traffic. If you're still planning to be unimanual, MolmoAct2-BimanualYAM **will not work** — it's a fixed 14-D bimanual policy. For unimanual you'd want `MolmoAct2-SO100_101` or fine-tuning the base `MolmoAct2`.
+1. **Gripper variant per arm.** Pictures sent earlier. Factory default is usually `linear_4310`.
+2. **Camera mounting.** D435 overhead, two D405s positioned per Ai2's reference design (`assets/m.png` in the molmoact2 repo).
+3. **Workspace.** Two orange cubes and a box positioned within each arm's reach (~700 mm each).
+4. **Push remote.** Local-only until `gh auth login`, then `gh repo create yam-molmoact2 --source=/home/andon/yam-tests/molmoact2-setup --private --push`.
 
 ## Progress log
 
 (Newest first.)
 
-- T+75m — **Server up and smoke test PASS.** Started inference server in tmux `server`, posted synthetic frames via `scripts/smoke_test_server.py`. Returned (30, 14) actions, server dt ~330ms steady-state. Pipeline confirmed working on RTX 5090/Blackwell.
-- T+60m — HF download complete (21 GB on disk, 5 shards). einops dep missing → added, re-synced.
-- T+50m — Disk pressure observed (99% full at peak); cleared OK after dedupe.
-- T+45m — Tasks 1–5, 8, 9 complete. Client + launchers committed (local). HF download ~20% complete. Report at v2.
-- T+30m — Wrote `scripts/yam_client.py` (full client loop with safety caps). Wrote launcher shell scripts.
+- T+90m — Subagent review applied. Fixed gripper-units error ([0,1] not radians), removed fluff, added udev/CAN/server-lifecycle notes, corrected stride math.
+- T+75m — **Server up, smoke test PASS.** Tmux session `server`. Returned (30, 14) actions, server dt ~330 ms.
+- T+60m — HF download complete (21 GB on disk). `einops` missing dep → added.
+- T+50m — Disk pressure noted (peaked at 99%); resolved after dedup.
+- T+45m — Client + launchers committed locally.
+- T+30m — Wrote `yam_client.py` with safety caps.
 - T+25m — Added `pyrealsense2`, `json-numpy`, `requests` to i2rt venv. Sim YAM smoke test passed.
-- T+15m — Started `uv sync` + `hf download MolmoAct2-BimanualYAM` in tmux session `mact2`.
-- T+10m — Cloned `allenai/molmoact2`. Discovered `pyproject.toml` not yet in main — wrote minimal one matching the validated stack (torch 2.5.1+cu121, transformers 4.57).
-- T+5m — Confirmed RTX 5090 (32 GB), CAN buses up at 1 Mbit/s, RealSense not plugged in.
-- T+0  — Workspace + report scaffolded. MolmoAct2 docs read end-to-end.
+- T+15m — Started `uv sync` + `hf download` in tmux `mact2`.
+- T+10m — Cloned `allenai/molmoact2`. `pyproject.toml` not in main → wrote one. Initially targeted cu121 (Ai2's validated stack); failed on Blackwell sm_120 → bumped to cu128.
+- T+5m — Confirmed RTX 5090, CAN up, RealSense absent.
+- T+0  — Workspace + report scaffolded.
