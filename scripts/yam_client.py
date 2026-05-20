@@ -395,6 +395,25 @@ def main() -> None:
                 args.instruction, args.num_steps, args.timeout_s,
             )
 
+            # Per-query diagnostic: what is the model actually asking for?
+            # action[0] is what we'll command at this tick. The delta from
+            # current state tells us how much motion the model wants. The
+            # range across the horizon tells us whether the model expects
+            # any motion within this batch at all.
+            a0 = actions[0]
+            delta0 = a0 - state
+            horizon_range = (actions.max(axis=0) - actions.min(axis=0))
+            arm_delta_max = float(np.max(np.abs(delta0[:6]) ) if delta0.size >= 6 else 0.0)
+            arm_delta_max = max(arm_delta_max, float(np.max(np.abs(delta0[7:13]))))
+            horizon_arm_span = float(max(np.max(horizon_range[:6]),
+                                          np.max(horizon_range[7:13])))
+            log.info(
+                "/act rtt=%dms  |a0-state|_max(arm)=%.3f rad  horizon span(arm)=%.3f rad  "
+                "L_grip=%.2f->%.2f  R_grip=%.2f->%.2f",
+                rtt_ms, arm_delta_max, horizon_arm_span,
+                state[6], a0[6], state[13], a0[13],
+            )
+
             stride = max(1, args.horizon_stride)
             n_to_play = min(stride, actions.shape[0])
             for i in range(n_to_play):
