@@ -54,15 +54,27 @@ STATE_DIM = 14   # per-arm 7-D × 2
 ARM_DOFS = 7     # 6 arm joints + 1 gripper
 
 
-@dataclass
 class CameraStream:
-    """One RealSense color stream. Cached frame is the latest grab."""
-    serial: str
-    name: str
-    width: int = 640
-    height: int = 480
-    fps: int = 30
-    pipeline: object = None  # rs.pipeline at runtime
+    """Base camera interface — start, grab one HxWx3 uint8 RGB frame, stop."""
+
+    def __init__(self, name: str, width: int = 640, height: int = 480, fps: int = 30):
+        self.name = name
+        self.width = width
+        self.height = height
+        self.fps = fps
+
+    def start(self) -> None: raise NotImplementedError
+    def grab(self) -> np.ndarray: raise NotImplementedError
+    def stop(self) -> None: raise NotImplementedError
+
+
+class RealSenseStream(CameraStream):
+    """RealSense color stream via librealsense."""
+
+    def __init__(self, serial: str, name: str, **kw):
+        super().__init__(name, **kw)
+        self.serial = serial
+        self.pipeline = None
 
     def start(self) -> None:
         import pyrealsense2 as rs
@@ -71,20 +83,64 @@ class CameraStream:
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
         self.pipeline = rs.pipeline()
         self.pipeline.start(cfg)
-        log.info("camera %s (%s) started @ %dx%d/%d Hz", self.name, self.serial,
+        log.info("camera %s (RealSense %s) started @ %dx%d/%d Hz", self.name, self.serial,
                  self.width, self.height, self.fps)
 
     def grab(self) -> np.ndarray:
-        """Return an HxWx3 uint8 RGB image. Blocks briefly waiting for a frame."""
         frames = self.pipeline.wait_for_frames(timeout_ms=1000)
         color = frames.get_color_frame()
         if not color:
-            raise RuntimeError(f"camera {self.name} produced no color frame")
+            raise RuntimeError(f"camera {self.name} ({self.serial}) produced no color frame")
         return np.asanyarray(color.get_data())
 
     def stop(self) -> None:
         if self.pipeline is not None:
             self.pipeline.stop()
+
+
+class V4L2Stream(CameraStream):
+    """Generic UVC / V4L2 webcam via OpenCV. Used for non-RealSense cameras."""
+
+    def __init__(self, device: str, name: str, **kw):
+        super().__init__(name, **kw)
+        self.device = device
+        self.cap = None
+
+    def start(self) -> None:
+        import cv2
+        self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"failed to open {self.device}")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        # Discard a few frames so AE settles.
+        for _ in range(5):
+            self.cap.read()
+        log.info("camera %s (V4L2 %s) started @ %dx%d/%d Hz", self.name, self.device,
+                 self.width, self.height, self.fps)
+
+    def grab(self) -> np.ndarray:
+        import cv2
+        ok, frame = self.cap.read()
+        if not ok:
+            raise RuntimeError(f"camera {self.name} ({self.device}) produced no frame")
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    def stop(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+
+
+def make_camera(name: str, serial: Optional[str], v4l2_device: Optional[str]) -> CameraStream:
+    """Build the right camera backend based on which CLI flag was set."""
+    if serial and v4l2_device:
+        raise ValueError(f"{name}: pass exactly one of --{name}-cam-serial / --{name}-cam-v4l2")
+    if not serial and not v4l2_device:
+        raise ValueError(f"{name}: must pass --{name}-cam-serial or --{name}-cam-v4l2")
+    if serial:
+        return RealSenseStream(serial, name)
+    return V4L2Stream(v4l2_device, name)
 
 
 def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None) -> Robot:
@@ -183,9 +239,13 @@ def main() -> None:
     p.add_argument("--right-gripper", default="linear_4310",
                    choices=["crank_4310", "linear_3507", "linear_4310", "flexible_4310"],
                    help="Gripper type on the right arm")
-    p.add_argument("--top-cam-serial", required=True, help="RealSense D435 (overhead)")
-    p.add_argument("--left-cam-serial", required=True, help="RealSense D405 on/near left arm")
-    p.add_argument("--right-cam-serial", required=True, help="RealSense D405 on/near right arm")
+    # Per-camera: pass exactly one of --<slot>-cam-serial (RealSense) or --<slot>-cam-v4l2 (UVC webcam, e.g. /dev/video0)
+    p.add_argument("--top-cam-serial",   default=None, help="RealSense serial for overhead (top) camera")
+    p.add_argument("--top-cam-v4l2",     default=None, help="V4L2 device path for overhead (top) camera, e.g. /dev/video0")
+    p.add_argument("--left-cam-serial",  default=None, help="RealSense serial for left-arm camera")
+    p.add_argument("--left-cam-v4l2",    default=None, help="V4L2 device path for left-arm camera")
+    p.add_argument("--right-cam-serial", default=None, help="RealSense serial for right-arm camera")
+    p.add_argument("--right-cam-v4l2",   default=None, help="V4L2 device path for right-arm camera")
     p.add_argument("--server-url", default="http://127.0.0.1:8202/act",
                    help="MolmoAct2 server /act endpoint")
     p.add_argument("--instruction", required=True,
@@ -221,10 +281,10 @@ def main() -> None:
     left = init_arm(args.left_can, args.left_gripper)
     right = init_arm(args.right_can, args.right_gripper)
 
-    # Cameras.
-    top = CameraStream(args.top_cam_serial, "top")
-    cam_l = CameraStream(args.left_cam_serial, "left")
-    cam_r = CameraStream(args.right_cam_serial, "right")
+    # Cameras — each slot can be RealSense or V4L2 independently.
+    top   = make_camera("top",   args.top_cam_serial,   args.top_cam_v4l2)
+    cam_l = make_camera("left",  args.left_cam_serial,  args.left_cam_v4l2)
+    cam_r = make_camera("right", args.right_cam_serial, args.right_cam_v4l2)
     for c in (top, cam_l, cam_r):
         c.start()
 
