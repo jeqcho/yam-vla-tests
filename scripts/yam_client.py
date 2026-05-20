@@ -423,11 +423,20 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt -- shutting down")
     finally:
+        # During cleanup, a second Ctrl-C should hard-kill immediately rather
+        # than escape from cv2.cap.release() or any other blocking call.
+        def _hard_exit(_sig, _frame):
+            os._exit(130)  # 128 + SIGINT
+        try:
+            signal.signal(signal.SIGINT, _hard_exit)
+        except Exception:
+            pass
+
         log.info("Stopping cameras")
         for c in (top, cam_l, cam_r):
             try:
                 c.stop()
-            except Exception as e:
+            except BaseException as e:
                 log.warning("camera %s stop failed: %s", c.name, e)
         # Stop the i2rt SDK's per-arm background control threads. Without
         # this, the process won't exit even after main() returns -- the
@@ -438,7 +447,7 @@ def main() -> None:
                 continue
             try:
                 arm.close()
-            except Exception as e:
+            except BaseException as e:
                 log.warning("arm.close() failed: %s", e)
         log.info("Arms left in their last commanded position -- kill power if not safe.")
         # Force-exit: any thread that didn't honor close() (e.g. waiting on a
