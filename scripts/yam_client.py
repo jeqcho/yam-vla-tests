@@ -417,22 +417,29 @@ def main() -> None:
             )
 
             # Per-query diagnostic: what is the model actually asking for?
-            # action[0] is what we'll command at this tick. The delta from
-            # current state tells us how much motion the model wants. The
-            # range across the horizon tells us whether the model expects
-            # any motion within this batch at all.
-            a0 = actions[0]
-            delta0 = a0 - state
+            # We log:
+            #   - |action[i]-state|_max for i in {0, 5, 10, 19, 29} (arm joints only)
+            #     -> shows WHERE in the horizon the model wants to move
+            #   - horizon span(arm) -> max-min across all 30 actions
+            # If |a[29]-state| is large but |a[0..19]-state| is small, the model
+            # plans motion AFTER the stride cutoff and we never execute it.
+            def _arm_delta_max(a_idx: int) -> float:
+                d = actions[a_idx] - state
+                return float(max(np.max(np.abs(d[:6])), np.max(np.abs(d[7:13]))))
+            a0_d  = _arm_delta_max(0)
+            a5_d  = _arm_delta_max(min(5,  actions.shape[0]-1))
+            a10_d = _arm_delta_max(min(10, actions.shape[0]-1))
+            a19_d = _arm_delta_max(min(19, actions.shape[0]-1))
+            a29_d = _arm_delta_max(actions.shape[0]-1)
             horizon_range = (actions.max(axis=0) - actions.min(axis=0))
-            arm_delta_max = float(np.max(np.abs(delta0[:6]) ) if delta0.size >= 6 else 0.0)
-            arm_delta_max = max(arm_delta_max, float(np.max(np.abs(delta0[7:13]))))
             horizon_arm_span = float(max(np.max(horizon_range[:6]),
                                           np.max(horizon_range[7:13])))
             log.info(
-                "/act rtt=%dms  |a0-state|_max(arm)=%.3f rad  horizon span(arm)=%.3f rad  "
-                "L_grip=%.2f->%.2f  R_grip=%.2f->%.2f",
-                rtt_ms, arm_delta_max, horizon_arm_span,
-                state[6], a0[6], state[13], a0[13],
+                "/act rtt=%dms  arm |a[i]-state|_max @ i=0/5/10/19/29: %.3f/%.3f/%.3f/%.3f/%.3f rad  "
+                "horizon_span=%.3f rad  L_grip[0,29]=%.2f,%.2f  R_grip[0,29]=%.2f,%.2f",
+                rtt_ms, a0_d, a5_d, a10_d, a19_d, a29_d, horizon_arm_span,
+                actions[0][6],  actions[-1][6],
+                actions[0][13], actions[-1][13],
             )
 
             stride = max(1, args.horizon_stride)
