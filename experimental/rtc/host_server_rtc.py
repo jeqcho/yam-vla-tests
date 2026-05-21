@@ -53,8 +53,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from PIL import Image
 
-# Patch the stdlib `json` module so np.ndarray round-trips through JSON.
-json_numpy.patch()
+# NOTE: do NOT call json_numpy.patch() here. Globally patching stdlib json
+# breaks numpy.testing's import (which uses json.loads with its own
+# object_hook returning SimpleNamespace). json_numpy chains its hook around
+# the caller's, causing 'argument of type SimpleNamespace is not iterable'
+# when its hook then runs `"__numpy__" in dct`. Our FastAPI handlers use
+# json_numpy.loads/dumps explicitly, so the global patch is unnecessary.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,6 +127,7 @@ class RTCPolicy:
         # Import lerobot here so a missing install fails with a clear message
         # AT startup rather than at import-time of this module.
         try:
+            from lerobot.configs.types import FeatureType, PolicyFeature
             from lerobot.policies.molmoact2.configuration_molmoact2 import (
                 MolmoAct2Config,
             )
@@ -172,6 +177,15 @@ class RTCPolicy:
         # checkpoint (norm_tag yam_dual_molmoact2). When in doubt, keep
         # lerobot defaults — the policy class itself overrides them from
         # the HF checkpoint when it loads.
+        # output_features must include the action feature with a positive
+        # shape, otherwise _output_action_dim() raises.
+        # input_features should ONLY include the state -- if image features
+        # are present here, the normalizer iterates over them and calls
+        # torch.as_tensor(PIL.Image), which fails with "Could not infer dtype
+        # of Image". Image handling is done separately by the MolmoAct2
+        # PackInputs processor step (which reads config.image_keys directly).
+        action_feature = PolicyFeature(type=FeatureType.ACTION, shape=(ACTION_DIM,))
+        state_feature = PolicyFeature(type=FeatureType.STATE,  shape=(STATE_DIM,))
         self.config = MolmoAct2Config(
             checkpoint_path=repo_id,
             norm_tag=NORM_TAG,
@@ -181,6 +195,9 @@ class RTCPolicy:
             chunk_size=CHUNK_SIZE,
             n_action_steps=CHUNK_SIZE,
             rtc_config=self.rtc_config,
+            inference_action_mode="continuous",
+            input_features={STATE_KEY: state_feature},
+            output_features={ACTION_KEY: action_feature},
         )
         log.info(
             "MolmoAct2Config: repo=%s, norm_tag=%s, image_keys=%s",
@@ -241,41 +258,31 @@ class RTCPolicy:
               "num_steps": int,
             }
         """
-        # Import inside the method so a stale import in the policy module
-        # doesn't poison this hot path (also keeps the file importable even
-        # if lerobot is missing — predict() will raise at call-time instead).
-        # On the molmoact2-policy branch TransitionKey lives at lerobot.types,
-        # not lerobot.configs.types where older versions kept it.
-        from lerobot.types import TransitionKey
-
         state_f32 = np.asarray(state, dtype=np.float32).reshape(-1)
         if state_f32.shape != (STATE_DIM,):
             raise ValueError(
                 f"state must be shape ({STATE_DIM},), got {state_f32.shape}"
             )
 
-        # The lerobot processor expects PIL images at the keys defined in
-        # CAMERA_KEYS, plus the 14-D state at observation.state, plus task in
-        # complementary["task"]. We build a single-batch EnvTransition.
-        observation: dict[str, Any] = {
+        # The lerobot processor pipeline's default `to_transition` is
+        # `batch_to_transition`, which expects a FLAT dict where keys
+        # starting with "observation." become the observation dict and
+        # "task" goes into complementary_data. (See
+        # lerobot.processor.converters.batch_to_transition and
+        # _extract_complementary_data.) We were previously building a
+        # TransitionKey-keyed dict, which the pipeline doesn't recognize as
+        # a batch -- the first ObservationProcessorStep then sees None.
+        batch_in: dict[str, Any] = {
             CAMERA_KEYS[0]: _to_pil(top_cam),
             CAMERA_KEYS[1]: _to_pil(left_cam),
             CAMERA_KEYS[2]: _to_pil(right_cam),
             STATE_KEY: torch.from_numpy(state_f32).to(self.device),
-        }
-        complementary: dict[str, Any] = {"task": str(instruction)}
-
-        # EnvTransition is a dict keyed by TransitionKey enum (see lerobot
-        # source). We build it as a plain dict and let the preprocessor
-        # pipeline figure out routing.
-        transition: dict[Any, Any] = {
-            TransitionKey.OBSERVATION: observation,
-            TransitionKey.COMPLEMENTARY_DATA: complementary,
+            "task": str(instruction),
         }
 
         with self._lock:
             # Preprocess: tokenize prompt + images, normalize state, etc.
-            batch = self.pre(transition)
+            batch = self.pre(batch_in)
 
             # Convert leftover to a torch tensor on the policy device. Shape
             # expected by the model: (B, L, action_dim). We have B=1.
@@ -290,13 +297,16 @@ class RTCPolicy:
                     torch.from_numpy(pcl).to(self.device).unsqueeze(0)
                 )
 
-            # Run the policy with RTC kwargs.
+            # Run the policy with RTC kwargs. inference_action_mode must be
+            # set explicitly; "continuous" matches what the BimanualYAM
+            # checkpoint was trained for (flow-matching expert).
             action_chunk = self.policy.predict_action_chunk(
                 batch,
                 num_steps=int(num_steps),
                 inference_delay=int(inference_delay) if inference_delay else None,
                 prev_chunk_left_over=prev_chunk_tensor,
                 execution_horizon=int(execution_horizon),
+                inference_action_mode="continuous",
             )
             # action_chunk: (B, T, action_dim) before postprocessing. We push
             # it through the postprocessor for unnormalization. The postproc

@@ -29,9 +29,12 @@ Bootstrap with:
   VIRTUAL_ENV=$VENV uv pip install \\
       transformers fastapi 'uvicorn[standard]' json-numpy \\
       huggingface_hub hf-transfer pillow numpy accelerate \\
-      safetensors einops requests
+      safetensors einops requests scipy
   VIRTUAL_ENV=$VENV uv pip install --no-deps \\
       'lerobot @ git+https://github.com/allenai/lerobot.git@molmoact2-policy'
+  VIRTUAL_ENV=$VENV uv pip install \\
+      draccus==0.10.0 opencv-python-headless gymnasium termcolor \\
+      tqdm packaging
 EOF
     exit 2
 fi
