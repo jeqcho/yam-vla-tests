@@ -307,6 +307,10 @@ def main() -> None:
                    help="Per-joint per-tick clip (rad)")
     p.add_argument("--gripper-step", type=float, default=DEFAULT_GRIPPER_STEP,
                    help="Gripper per-tick clip (normalized units)")
+    p.add_argument("--dump-frames",  default=None,
+                   help="If set, save the first {top,left,right} frame the client sends to "
+                        "the server into this directory as PNGs, then exit. Useful for "
+                        "visually verifying the model is seeing what we think it is.")
     p.add_argument("--horizon-stride", type=int, default=DEFAULT_HORIZON_STRIDE,
                    help="Apply this many steps from each returned horizon before re-querying. "
                         "With train_fps=30 and stride=6, server is queried 5 Hz.")
@@ -389,6 +393,24 @@ def main() -> None:
             top_img = top.grab()
             left_img = cam_l.grab()
             right_img = cam_r.grab()
+
+            # One-shot frame-dump for visual debugging. Run with --dump-frames /tmp/foo
+            # then inspect /tmp/foo/top.png / left.png / right.png to see exactly what
+            # the model is being shown.
+            if args.dump_frames:
+                import os
+                import cv2
+                os.makedirs(args.dump_frames, exist_ok=True)
+                for name, img in [("top", top_img), ("left", left_img), ("right", right_img)]:
+                    # Frames are RGB uint8 from our streams; cv2.imwrite expects BGR.
+                    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    out_path = os.path.join(args.dump_frames, f"{name}.png")
+                    cv2.imwrite(out_path, bgr)
+                    log.info("dumped %s (%dx%d) to %s", name, img.shape[1], img.shape[0], out_path)
+                log.info("dump-frames mode -- exiting before any inference.")
+                import sys as _sys
+                _sys.stdout.flush()
+                os._exit(0)
 
             actions, rtt_ms = post_actions(
                 args.server_url, top_img, left_img, right_img, state,
