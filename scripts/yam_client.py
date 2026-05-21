@@ -566,6 +566,10 @@ def main() -> None:
     p.add_argument("--rerun-connect", default=None, metavar="HOST:PORT",
                    help="Connect to an existing rerun viewer at HOST:PORT instead of "
                         "spawning one. Example: 127.0.0.1:9876")
+    p.add_argument("--rerun-save", default=None, metavar="PATH",
+                   help="Also save the rerun recording to a .rrd file. Even if the "
+                        "live viewer lags, the file lets you replay the full session "
+                        "later with `rerun PATH`. Implies --rerun.")
     args = p.parse_args()
 
     # Loud-warn the user if they've disabled the per-step clip. Six months from
@@ -586,18 +590,34 @@ def main() -> None:
 
     # Initialize Rerun viewer if requested. Done before arms init so any setup
     # failures (missing display, port already in use) happen before motors turn on.
-    if args.rerun:
+    rerun_requested = args.rerun or (args.rerun_save is not None)
+    if rerun_requested:
         try:
             import rerun as rr
             global _rr
             _rr = rr
-            rr.init("yam_inference", spawn=(args.rerun_connect is None))
-            if args.rerun_connect:
+            rr.init("yam_inference")
+            # Spawn the matching-version viewer from the venv. Without this,
+            # rr.spawn() runs whatever `rerun` is first on PATH -- often a
+            # mismatched system-wide install (e.g. miniforge's 0.26.x while
+            # the SDK is 0.32.x). A version skew between viewer and SDK makes
+            # the viewer drop / mis-render messages, which looks like 'rerun
+            # is laggy' from the user's side.
+            if args.rerun_connect is None:
+                venv_rerun = "/home/andon/yam-tests/i2rt/.venv/bin/rerun"
+                spawn_kwargs = {}
+                if os.path.isfile(venv_rerun):
+                    spawn_kwargs["executable_name"] = venv_rerun
+                rr.spawn(**spawn_kwargs)
+                log.info("Rerun: spawned viewer (%s)",
+                         spawn_kwargs.get("executable_name", "from PATH"))
+            else:
                 host, _, port = args.rerun_connect.partition(":")
                 rr.connect_grpc(f"rerun+http://{host}:{port}/proxy")
                 log.info("Rerun: connected to viewer at %s", args.rerun_connect)
-            else:
-                log.info("Rerun: spawned local viewer")
+            if args.rerun_save:
+                rr.save(args.rerun_save)
+                log.info("Rerun: also saving recording to %s", args.rerun_save)
         except ImportError:
             log.error("--rerun requested but rerun-sdk not installed in this venv. "
                       "Install with: VIRTUAL_ENV=/home/andon/yam-tests/i2rt/.venv "
