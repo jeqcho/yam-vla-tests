@@ -77,6 +77,7 @@ image = (
         "torchaudio==2.8.0",
         extra_index_url="https://download.pytorch.org/whl/cu129",
     )
+    .pip_install("packaging", "ninja", "wheel", "setuptools>=68")
     .run_commands(
         "MAX_JOBS=8 pip install --no-build-isolation flash-attn==2.7.4.post1 || "
         "MAX_JOBS=8 pip install --no-build-isolation flash-attn",

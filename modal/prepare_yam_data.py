@@ -138,24 +138,33 @@ def _split_one_shard(args: tuple) -> dict:
     shard_name = shard_pq.stem        # "file-000"
 
     # Per-episode metadata sidecar — tells us which video file + timestamps.
+    # Read via pyarrow directly: pandas chokes on the nested-list stats columns
+    # ("data type 'list<element: double>[pyarrow]' not understood").
     ep_meta_path = src_root / "meta" / "episodes" / chunk_str / f"{shard_name}.parquet"
     ep_meta_lookup: dict[int, dict] = {}
     if ep_meta_path.exists():
-        em = pd.read_parquet(ep_meta_path)
-        for _, row in em.iterrows():
-            ep_idx_raw = int(_unbox(row["episode_index"]))
-            entry: dict = {"length": int(_unbox(row["length"])), "cams": {}}
+        import pyarrow.parquet as pq
+        wanted = ["episode_index", "length"]
+        for cam in cam_keys:
+            for suf in ("file_index", "chunk_index", "from_timestamp", "to_timestamp"):
+                wanted.append(f"videos/observation.images.{cam}/{suf}")
+        tbl = pq.read_table(ep_meta_path, columns=wanted)
+        em = tbl.to_pydict()
+        n_eps = len(em["episode_index"])
+        for i in range(n_eps):
+            ep_idx_raw = int(_unbox(em["episode_index"][i]))
+            entry: dict = {"length": int(_unbox(em["length"][i])), "cams": {}}
             for cam in cam_keys:
                 fi_col = f"videos/observation.images.{cam}/file_index"
                 ci_col = f"videos/observation.images.{cam}/chunk_index"
                 from_col = f"videos/observation.images.{cam}/from_timestamp"
                 to_col = f"videos/observation.images.{cam}/to_timestamp"
-                if fi_col in row.index:
+                if fi_col in em:
                     entry["cams"][cam] = {
-                        "file_index": int(_unbox(row[fi_col])),
-                        "chunk_index": int(_unbox(row[ci_col])),
-                        "from_ts": float(_unbox(row[from_col])),
-                        "to_ts": float(_unbox(row[to_col])),
+                        "file_index": int(_unbox(em[fi_col][i])),
+                        "chunk_index": int(_unbox(em[ci_col][i])),
+                        "from_ts": float(_unbox(em[from_col][i])),
+                        "to_ts": float(_unbox(em[to_col][i])),
                     }
             ep_meta_lookup[ep_idx_raw] = entry
     else:
