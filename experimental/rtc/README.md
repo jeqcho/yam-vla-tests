@@ -103,17 +103,37 @@ In another terminal:
     --max-step-rad 0.05
 ```
 
-Same CLI surface as `scripts/run_client.sh` plus three RTC-specific flags:
+Same CLI surface as `scripts/run_client.sh` plus the RTC-specific knobs:
 
-- `--execution-horizon` (default 10): how many actions per chunk get
-  executed before re-querying. The remainder is sent back as
-  `prev_chunk_left_over` so the server inpaints the next chunk's prefix
-  smoothly.
-- `--inference-delay-mode` (default `ema-rtt`): how to compute the
-  `inference_delay` field sent to the server. `ema-rtt` rounds
-  `EMA(RTT) / dt` up; `fixed` uses a constant; `zero` degenerates to
-  vanilla chunked inference.
+**Horizon and delay control** (these are now adaptive by default):
+
+- `--execution-horizon` (default 10): BOOTSTRAP value for `execution_horizon`,
+  used only for the very first /act call before any RTT measurement.
+  After that the client adapts `execution_horizon = inference_delay =
+  ceil(EMA(RTT) / dt)`, clamped to `[--rtc-min-horizon, --rtc-max-horizon]`.
+  Per the RTC paper's canonical regime, both quantities are kept equal in
+  steady state so the leftover prefix slice is always wall-clock-aligned.
+- `--rtc-min-horizon` (default 5): lower bound on the adaptive horizon.
+- `--rtc-max-horizon` (default 20): upper bound on the adaptive horizon.
+- `--inference-delay-mode` (default `ema-rtt`): `ema-rtt` adapts as
+  described above; `fixed` pins both quantities to `--inference-delay-fixed`;
+  `zero` forces inference_delay=0 (diagnostic ablation that disables
+  prefix anchoring).
 - `--inference-delay-ema-alpha` (default 0.5): EMA smoothing factor.
+
+**RTC sampler tuning** (per-request overrides, no server restart needed):
+
+- `--rtc-max-guidance-weight FLOAT`: override `RTCConfig.max_guidance_weight`
+  for every request this session. Higher = tighter prefix anchoring; lower
+  = more model freedom near chunk boundaries. Default (server-side) is 10.0
+  per the Pi-0 paper.
+- `--rtc-schedule {linear,exp,zeros,ones}`: override
+  `prefix_attention_schedule`. `linear` is the paper default.
+- `--rtc-debug`: turn on `RTCConfig.debug=True` per request (records
+  per-step intermediate state). Off by default for speed.
+- `--seed INT`: seed the flow-matching noise initialization for
+  deterministic chunk generation. Useful for reproducing a specific
+  rollout; leave unset for production.
 
 Same safety as `yam_client.py`: per-tick clip, return-on-exit ramp,
 journal prompt, SDK lock fix, cameras-before-arms.
