@@ -1,0 +1,11 @@
+# Additional pip installs needed on top of /home/andon/yam-tests/molmoact2-setup/.venv
+# (which already provides torch 2.8+cu128, transformers 4.57, fastapi, uvicorn,
+# pillow, json-numpy, etc).
+#
+# Install with:
+#   VIRTUAL_ENV=/home/andon/yam-tests/molmoact2-setup/.venv uv pip install -r requirements.txt
+#
+# We pin to a specific branch of Ai2's lerobot fork; this is the branch that
+# carries the MolmoAct2 policy + RTC implementation. If upstream branches
+# change, update this.
+lerobot @ git+https://github.com/allenai/lerobot.git@molmoact2-policy
