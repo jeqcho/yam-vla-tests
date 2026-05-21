@@ -179,9 +179,39 @@ def list_realsense() -> list[str]:
 
 
 def list_v4l2_uvc() -> list[str]:
-    """Return /dev/videoN paths that are UVC webcams (not RealSense)."""
+    """Return stable /dev/v4l/by-id/... paths for UVC webcams (non-RealSense).
+
+    We deliberately return by-id symlinks rather than /dev/videoN, because
+    v4l2 device numbering can shift between sessions (USB enumeration order
+    is not stable when RealSense and webcams share root hubs). by-id paths
+    are derived from the USB vendor/product string and are stable across
+    re-enumeration.
+
+    Only the first (index0) entry per camera is returned -- it's the capture
+    interface; index1 is typically a metadata stream we don't want.
+    """
     out = []
     seen_devices = set()
+    byid_dir = "/dev/v4l/by-id"
+    if os.path.isdir(byid_dir):
+        for link in sorted(os.listdir(byid_dir)):
+            if "realsense" in link.lower():
+                continue
+            if "-video-index0" not in link:
+                continue
+            full = os.path.join(byid_dir, link)
+            try:
+                target = os.path.realpath(full)  # e.g. /dev/video12
+            except Exception:
+                continue
+            if target in seen_devices:
+                continue
+            seen_devices.add(target)
+            out.append(full)
+        if out:
+            return out
+
+    # Fallback: scan /sys/class/video4linux/ and use /dev/videoN paths.
     for d in sorted(glob.glob("/sys/class/video4linux/video*")):
         try:
             name = open(os.path.join(d, "name")).read().strip().lower()
@@ -190,8 +220,6 @@ def list_v4l2_uvc() -> list[str]:
         if "realsense" in name:
             continue
         node = "/dev/" + os.path.basename(d)
-        # Many webcams expose video0 and video1 (capture + metadata); we want
-        # the first per unique device. Use sysfs symlink to dedupe.
         try:
             dev_path = os.path.realpath(os.path.join(d, "device"))
         except Exception:
