@@ -30,11 +30,17 @@ import numpy as np
 
 
 def install_profiler(dm_module):
-    """Monkey-patch DMSingleMotorCanInterface.set_commands with sub-timings.
+    """Monkey-patch DMChainCanInterface.set_commands with sub-timings.
+
+    DMChainCanInterface (line 367 of dm_driver.py) is the class that
+    motor_chain_robot uses as `self.motor_chain`. Its set_commands (line
+    699) is the call our v2 profiler narrowed in on. command_lock (line
+    450) is on this same class -- also held by Thread-1's
+    _set_torques_and_update_state loop on every CAN cycle.
 
     We replicate the original implementation, separately timing each step.
     """
-    SingleIface = dm_module.DMSingleMotorCanInterface
+    ChainIface = dm_module.DMChainCanInterface
     MotorCmd = dm_module.MotorCmd
 
     stats = {
@@ -47,7 +53,7 @@ def install_profiler(dm_module):
     slow: list[dict] = []
     THRESH_MS = 50.0
 
-    orig = SingleIface.set_commands
+    orig = ChainIface.set_commands
 
     def patched(self, torques, pos=None, vel=None, kp=None, kd=None, get_state=True):
         t0 = time.perf_counter()
@@ -109,7 +115,7 @@ def install_profiler(dm_module):
                   f"read={ev['read_ms']:5.2f}", flush=True)
         return result
 
-    SingleIface.set_commands = patched
+    ChainIface.set_commands = patched
     return stats, slow
 
 
@@ -128,8 +134,8 @@ def main() -> int:
 
     from i2rt.motor_drivers import dm_driver as dm
     stats, slow = install_profiler(dm)
-    print("installed DMSingleMotorCanInterface.set_commands profiler "
-          "(threshold 50ms; ACQUIRE column = lock wait time)", flush=True)
+    print("installed DMChainCanInterface.set_commands profiler "
+          "(threshold 50ms; ACQUIRE column = command_lock wait time)", flush=True)
 
     from i2rt.robots.get_robot import get_yam_robot
     from i2rt.robots.utils import ArmType, GripperType
