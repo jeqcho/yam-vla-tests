@@ -22,19 +22,46 @@ harness).
 
 ## One-time setup
 
-The RTC server needs Ai2's lerobot fork in the existing server venv. Install:
+The RTC server needs a SEPARATE Python 3.12 venv (`.venv-rtc`) because
+Ai2's lerobot fork (`molmoact2-policy` branch) requires Python ≥3.12,
+while the main `molmoact2-setup/.venv` is pinned to 3.11. The two
+servers (`:8202` legacy, `:8203` RTC) run side-by-side from different
+venvs.
+
+Bootstrap the RTC venv from scratch (~5 min, ~5 GB):
 
 ```bash
-VIRTUAL_ENV=/home/andon/yam-tests/molmoact2-setup/.venv \
-  uv pip install -r experimental/rtc/requirements.txt
+cd /home/andon/yam-tests/molmoact2-setup
+
+# 1. Create the venv on Python 3.12
+uv venv --python 3.12 .venv-rtc
+
+# 2. Install torch+CUDA from PyTorch's index (cu128 = RTX 5090 / Blackwell)
+VIRTUAL_ENV=$PWD/.venv-rtc uv pip install torch==2.7.1 torchvision==0.22.1 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# 3. Install the inference stack
+VIRTUAL_ENV=$PWD/.venv-rtc uv pip install \
+    transformers fastapi 'uvicorn[standard]' json-numpy \
+    huggingface_hub hf-transfer pillow numpy accelerate \
+    safetensors einops requests scipy
+
+# 4. Install lerobot fork (--no-deps to avoid re-resolving torch)
+VIRTUAL_ENV=$PWD/.venv-rtc uv pip install --no-deps \
+    'lerobot @ git+https://github.com/allenai/lerobot.git@molmoact2-policy'
+
+# 5. Install lerobot's runtime deps that --no-deps skipped
+VIRTUAL_ENV=$PWD/.venv-rtc uv pip install \
+    draccus==0.10.0 opencv-python-headless gymnasium \
+    termcolor tqdm packaging
 ```
 
-This adds the lerobot package only; torch / transformers / fastapi / etc.
-are already pinned in the setup venv. The lerobot fork's heavy deps (
-diffusers, peft, draccus etc.) will land alongside; expect ~200 MB of new
-packages and ~30 s of resolver time.
+`scipy` is needed by the FAST action tokenizer that lerobot pulls in.
+`draccus`/`opencv-python-headless`/`gymnasium`/`termcolor`/`tqdm` are
+declared deps of `lerobot` that `--no-deps` skipped.
 
-No new install is needed in the i2rt venv — the client reuses
+No new install is needed in the i2rt venv — the RTC client runs from
+that venv (it needs the i2rt SDK to drive the arms) and reuses
 `scripts/yam_client.py`'s safety harness via `sys.path.insert(...)`.
 
 ## Running the stack
@@ -141,24 +168,43 @@ Response: same shape (`actions` + `dt_ms`), with one extra dict
 horizon, inference_delay, and num_steps used. The non-RTC client will
 ignore that field; the RTC client uses it for sanity logging.
 
-## Known unknowns
+## Bring-up notes (issues encountered and how they were fixed)
 
-These are flagged in INVESTIGATION.md as well; copying here for runtime
-visibility:
+For posterity, here's what didn't work on the first try and how it was
+resolved. All fixes are committed in the current `host_server_rtc.py`.
 
-1. **First-run discovery**: `MolmoAct2Policy(config)` may complain about a
-   missing `dataset_stats` argument despite `make_molmoact2_pre_post_processors`
-   falling back to `norm_stats.json`. If it does, the fix is to hand-load
-   `norm_stats.json` and pass the matching dict.
+1. **Python version**: lerobot fork requires `>=3.12`; the main `.venv`
+   is pinned to `==3.11`. Solution: separate `.venv-rtc` (see Setup).
 
-2. **`image_keys` exact names**: we use the strings spelled out in
-   `norm_stats.json[metadata_by_tag][yam_dual_molmoact2][camera_keys]`,
-   i.e. `observation.images.{top,left,right}`. If the lerobot processor
-   has hardcoded different keys (e.g. `left_wrist`), the server will
-   error at startup; this is a 1-line `CAMERA_KEYS` fix in
-   `host_server_rtc.py`.
+2. **`TransitionKey` import path**: lives at `lerobot.types` on this
+   branch, not `lerobot.configs.types`.
 
-3. **`inference_delay` clamping**: the client clamps the computed delay
+3. **`json_numpy.patch()` globally patches stdlib `json`**: breaks
+   `numpy.testing` import (it calls `json.loads(..., object_hook=…
+   SimpleNamespace…)`; json_numpy chains its hook around the caller's
+   and fails on `"__numpy__" in SimpleNamespace`). Solution: remove the
+   global patch; handlers already use `json_numpy.loads/dumps` directly.
+
+4. **Preprocessor batch shape**: pipeline's `to_transition` defaults to
+   `batch_to_transition`, which expects a FLAT dict keyed by
+   `"observation.*"` and `"task"`, not a `TransitionKey`-keyed dict.
+
+5. **`inference_action_mode` required**: must be set explicitly (we set
+   `"continuous"` at config construction).
+
+6. **`output_features` required with positive shape**: needed by
+   `_output_action_dim()`. Set both `input_features` (state only) and
+   `output_features` (action) with explicit `PolicyFeature(type=…,
+   shape=…)`. DO NOT include image features in `input_features` — the
+   normalizer iterates over them and calls `torch.as_tensor(PIL.Image)`,
+   which fails.
+
+7. **`@torch.inference_mode()` breaks RTC**: RTC's denoise_step uses
+   `torch.autograd.grad` for its correction term. inference_mode kills
+   grad tracking and the autograd call raises. Removed the decorator;
+   model is still in `.eval()`.
+
+8. **`inference_delay` clamping**: the client clamps the computed delay
    to `[0, 15]` (half a chunk). If RTT is so high that this clamp fires
    regularly, RTC's prefix-attention has effectively no leftover left to
    inpaint and we degenerate to async-time-aligned behavior. The
