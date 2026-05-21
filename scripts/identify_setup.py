@@ -22,6 +22,7 @@ before close. SDK lock fix is auto-applied via yam_client import.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import sys
@@ -29,14 +30,55 @@ import time
 import glob
 from pathlib import Path
 
+# Silence i2rt + python-can chatter BEFORE importing the SDK, otherwise
+# interactive prompts get buried under per-step INFO logs and CAN-close
+# tracebacks.
+_NOISY_LOGGERS = ("root", "i2rt", "i2rt.robots.utils", "i2rt.robots.get_robot",
+                  "i2rt.robots.motor_chain_robot", "can",
+                  "can.interfaces.socketcan", "can.interfaces.socketcan.socketcan")
+logging.basicConfig(level=logging.ERROR, force=True)
+for _n in _NOISY_LOGGERS:
+    logging.getLogger(_n).setLevel(logging.ERROR)
+
 import numpy as np
 
 # Importing yam_client triggers install_sdk_lock_fix at module load.
 sys.path.insert(0, "/home/andon/yam-tests/molmoact2-setup/scripts")
 import yam_client  # noqa: F401  -- side effect
 
+# Re-silence after yam_client may have re-configured logging.
+logging.getLogger().setLevel(logging.ERROR)
+for _n in _NOISY_LOGGERS:
+    logging.getLogger(_n).setLevel(logging.ERROR)
+
 from i2rt.robots.get_robot import get_yam_robot
 from i2rt.robots.utils import ArmType, GripperType
+
+
+def _quiet_close(robot) -> None:
+    """Close a robot and swallow shutdown-time CAN-thread spam.
+
+    The background CAN thread races the socket teardown: as the fd goes
+    to -1, in-flight bus.send() calls raise ValueError and the thread
+    prints a multi-line traceback to stderr. Redirect stderr to /dev/null
+    for the close + a short grace window so the next prompt stays readable.
+    """
+    null_f = open(os.devnull, "w")
+    old_err_fd = os.dup(2)
+    old_stderr = sys.stderr
+    try:
+        os.dup2(null_f.fileno(), 2)
+        sys.stderr = null_f
+        try:
+            robot.close()
+        except Exception:
+            pass
+        time.sleep(0.6)  # give background threads time to die quietly
+    finally:
+        sys.stderr = old_stderr
+        os.dup2(old_err_fd, 2)
+        os.close(old_err_fd)
+        null_f.close()
 
 
 CONFIG_PATH = Path("/home/andon/yam-tests/molmoact2-setup/yam_setup_config.json")
@@ -120,13 +162,11 @@ def identify_arms(can_a: str, can_b: str, gripper: str) -> dict:
         mapping = {"left_can": can_b, "right_can": can_a}
     print(f"\nRecorded: left={mapping['left_can']}  right={mapping['right_can']}")
 
-    # Safety: close both arms cleanly (each arm holds its startup pose; close()
-    # zeros torques but the pose is the user's chosen startup, which they
-    # accepted as droppable when they began the script).
-    try: arm_a.close()
-    except Exception: pass
-    try: arm_b.close()
-    except Exception: pass
+    # Safety: close both arms cleanly. _quiet_close suppresses the post-close
+    # CAN tracebacks so the next prompt stays readable.
+    _quiet_close(arm_a)
+    _quiet_close(arm_b)
+    print("\n[arms closed]\n", flush=True)
     return mapping
 
 
