@@ -22,6 +22,7 @@ import argparse
 import logging
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -586,6 +587,63 @@ def safe_command(
     return cmd, n_clipped
 
 
+class AsyncInferenceFetcher:
+    """Overlap inference with execution.
+
+    Usage:
+        fetcher = AsyncInferenceFetcher(...)
+        fetcher.kick_off(state, top_img, left_img, right_img)   # non-blocking
+        # ... execute current chunk, do other work ...
+        actions, rtt_ms = fetcher.wait_for_result()              # blocks if not done
+
+    Stores the in-flight POST in a background thread. Re-raises any HTTP /
+    parsing errors when .wait_for_result() is called. Single-slot: a new
+    kick_off() while one is in flight will raise.
+    """
+    def __init__(self, server_url: str, instruction: str, num_steps: int, timeout_s: float):
+        self._url = server_url
+        self._instr = instruction
+        self._num_steps = num_steps
+        self._timeout_s = timeout_s
+        self._thread: Optional[threading.Thread] = None
+        # Result is set by the worker thread. Read with thread.join() first.
+        # Sentinel value None means 'not yet completed'.
+        self._result: Optional[tuple] = None
+        self._error: Optional[str] = None
+
+    def kick_off(self, state: np.ndarray, top_img: np.ndarray,
+                 left_img: np.ndarray, right_img: np.ndarray) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("AsyncInferenceFetcher: previous request still in flight")
+        # Snapshot the inputs so the caller can mutate / re-grab without racing.
+        s = np.ascontiguousarray(state, dtype=np.float32).copy()
+        t = np.ascontiguousarray(top_img).copy()
+        l = np.ascontiguousarray(left_img).copy()
+        r = np.ascontiguousarray(right_img).copy()
+        self._result = None
+        self._error = None
+
+        def _worker():
+            try:
+                actions, rtt_ms = post_actions(
+                    self._url, t, l, r, s, self._instr, self._num_steps, self._timeout_s
+                )
+                self._result = (actions, rtt_ms)
+            except BaseException as e:  # noqa: BLE001
+                self._error = repr(e)
+        self._thread = threading.Thread(target=_worker, daemon=True)
+        self._thread.start()
+
+    def wait_for_result(self) -> tuple:
+        if self._thread is None:
+            raise RuntimeError("AsyncInferenceFetcher.wait_for_result with no in-flight request")
+        self._thread.join()
+        self._thread = None
+        if self._error is not None:
+            raise RuntimeError(f"async /act failed: {self._error}")
+        return self._result
+
+
 def post_actions(
     server_url: str,
     top: np.ndarray,
@@ -681,6 +739,16 @@ def main() -> None:
     p.add_argument("--horizon-stride", type=int, default=DEFAULT_HORIZON_STRIDE,
                    help="Apply this many steps from each returned horizon before re-querying. "
                         "With train_fps=30 and stride=6, server is queried 5 Hz.")
+    p.add_argument("--inference-mode", default="sync",
+                   choices=["sync", "async-naive", "async-time-aligned"],
+                   help="sync (default): POST blocks the inner loop -- arm holds for "
+                        "~RTT ms between chunks, stop-and-go motion. "
+                        "async-naive: kick off next POST when current chunk starts "
+                        "executing, apply a[0..stride-1] of each new chunk -- expected "
+                        "to have a backward jump at every chunk boundary (Phase 2 test). "
+                        "async-time-aligned: same overlap, but apply a[K..K+stride-1] "
+                        "where K=stride to compensate for inference latency -- the "
+                        "smooth replacement for sync (Phase 3).")
     p.add_argument("--timeout-s", type=float, default=15.0,
                    help="HTTP timeout per /act call (steady state). The first call after the server "
                         "comes up may take >5s because the model re-captures CUDA graphs for the "
@@ -876,143 +944,303 @@ def main() -> None:
     boundary_idx = 0
 
     try:
-        while not stop_flag["stop"]:
+        if args.inference_mode != "sync":
+            # =====================================================================
+            # ASYNC INFERENCE PATH (Phase 2: async-naive; Phase 3: async-time-aligned)
+            # ---------------------------------------------------------------------
+            # Overlap inference and execution by kicking off the NEXT POST in a
+            # background thread the moment the current chunk begins executing.
+            # If RTT < stride*dt the next chunk arrives before execution ends,
+            # so there is no idle gap between chunks (no stop-and-go).
+            #
+            # Action slicing differs by mode:
+            #   async-naive:        apply actions[0..stride-1]
+            #   async-time-aligned: apply actions[stride..2*stride-1]
+            #
+            # async-naive is the deliberately-broken Phase 2 control case: each
+            # chunk's a[0] was planned for the state we sent ~RTT ms ago, but
+            # the arm has now moved ~stride*dt of actual motion past that state,
+            # so applying a[0] commands a backward jump. The per-step clip
+            # catches it but motion is jerky.
+            #
+            # async-time-aligned is Phase 3: since the chunk was generated
+            # ~stride*dt ago and we're about to apply it now, the model's
+            # prediction for "the action at relative time stride*dt" is a[stride],
+            # which approximately equals the next intended pose. No jump.
+            # =====================================================================
+            chunk_start_idx = args.horizon_stride if args.inference_mode == "async-time-aligned" else 0
+            log.info("ASYNC mode = %s, chunk_start_idx = %d (apply a[%d..%d])",
+                     args.inference_mode, chunk_start_idx,
+                     chunk_start_idx, chunk_start_idx + args.horizon_stride - 1)
+
+            fetcher = AsyncInferenceFetcher(args.server_url, args.instruction,
+                                            args.num_steps, args.timeout_s)
+
+            # Bootstrap: do a synchronous first chunk so we have something to
+            # execute on iteration 1.
+            log.info("Async bootstrap: fetching initial chunk synchronously...")
             state = read_state(left, right)
             top_img = top.grab()
             left_img = cam_l.grab()
             right_img = cam_r.grab()
             _rr_log_observation(time.perf_counter() - loop_t0,
                                 top_img, left_img, right_img, state)
+            fetcher.kick_off(state, top_img, left_img, right_img)
+            actions, rtt_ms = fetcher.wait_for_result()
+            log.info("Async bootstrap OK (rtt=%.0f ms, actions shape=%s)",
+                     rtt_ms, actions.shape)
 
-            # One-shot frame-dump for visual debugging. Run with --dump-frames /tmp/foo
-            # then inspect /tmp/foo/top.png / left.png / right.png to see exactly what
-            # the model is being shown. NOTE: don't re-import os here; it's already at
-            # module level. A local `import os` inside this block would shadow it and
-            # break the finally's os._exit(0) call when dump-frames is NOT set.
-            if args.dump_frames:
-                import cv2
-                os.makedirs(args.dump_frames, exist_ok=True)
-                for name, img in [("top", top_img), ("left", left_img), ("right", right_img)]:
-                    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                    out_path = os.path.join(args.dump_frames, f"{name}.png")
-                    cv2.imwrite(out_path, bgr)
-                    log.info("dumped %s (%dx%d) to %s", name, img.shape[1], img.shape[0], out_path)
-                log.info("dump-frames mode -- exiting before any inference.")
-                sys.stdout.flush()
-                os._exit(0)
+            while not stop_flag["stop"]:
+                # Sample state + cams for the NEXT POST (which we're about to
+                # kick off). 'next_state' is what we'll log boundary diagnostics
+                # against -- it represents the arm's actual position at the
+                # moment we start executing the current chunk.
+                next_state = read_state(left, right)
+                next_top = top.grab()
+                next_left = cam_l.grab()
+                next_right = cam_r.grab()
+                _rr_log_observation(time.perf_counter() - loop_t0,
+                                    next_top, next_left, next_right, next_state)
 
-            actions, rtt_ms = post_actions(
-                args.server_url, top_img, left_img, right_img, state,
-                args.instruction, args.num_steps, args.timeout_s,
-            )
+                # Kick off the next /act in the background -- runs while we
+                # execute the current chunk on the arms.
+                fetcher.kick_off(next_state, next_top, next_left, next_right)
 
-            # Per-query diagnostic: what is the model actually asking for?
-            # We log:
-            #   - |action[i]-state|_max for i in {0, 5, 10, 19, 29} (arm joints only)
-            #     -> shows WHERE in the horizon the model wants to move
-            #   - horizon span(arm) -> max-min across all 30 actions
-            # If |a[29]-state| is large but |a[0..19]-state| is small, the model
-            # plans motion AFTER the stride cutoff and we never execute it.
-            def _arm_delta_max(a_idx: int) -> float:
-                d = actions[a_idx] - state
-                return float(max(np.max(np.abs(d[:6])), np.max(np.abs(d[7:13]))))
-            a0_d  = _arm_delta_max(0)
-            a5_d  = _arm_delta_max(min(5,  actions.shape[0]-1))
-            a10_d = _arm_delta_max(min(10, actions.shape[0]-1))
-            a19_d = _arm_delta_max(min(19, actions.shape[0]-1))
-            a29_d = _arm_delta_max(actions.shape[0]-1)
-            horizon_range = (actions.max(axis=0) - actions.min(axis=0))
-            horizon_arm_span = float(max(np.max(horizon_range[:6]),
-                                          np.max(horizon_range[7:13])))
-            log.info(
-                "/act rtt=%dms  arm |a[i]-state|_max @ i=0/5/10/19/29: %.3f/%.3f/%.3f/%.3f/%.3f rad  "
-                "horizon_span=%.3f rad  L_grip[0,29]=%.2f,%.2f  R_grip[0,29]=%.2f,%.2f",
-                rtt_ms, a0_d, a5_d, a10_d, a19_d, a29_d, horizon_arm_span,
-                actions[0][6],  actions[-1][6],
-                actions[0][13], actions[-1][13],
-            )
-
-            stride = max(1, args.horizon_stride)
-            n_to_play = min(stride, actions.shape[0])
-            _rr_log_inference(time.perf_counter() - loop_t0, actions,
-                              executed_idx=0, rtt_ms=rtt_ms,
-                              horizon_arm_span=horizon_arm_span)
-
-            # Chunk-boundary telemetry. Two quantities:
-            #   state_vs_a0: |new_chunk.a[0] - current_arm_state|, max over 12
-            #                arm joints. Tells us how much the arm would
-            #                "jump" if we naively apply a[0] right now.
-            #   tail_vs_a0:  |new_chunk.a[0] - prev_chunk.a[stride-1]|, max
-            #                over 12 arm joints. Tells us how big the
-            #                discontinuity is between the model's last
-            #                command and the model's next command.
-            # In sync, state_vs_a0 should be small (arm held during POST).
-            # In naive async, state_vs_a0 will spike because the arm moved
-            # during POST but the model planned from a stale state.
-            if last_chunk_tail is not None:
-                arm_idx = np.r_[0:6, 7:13]
-                a0 = actions[0]
-                state_vs_a0_arm = float(np.max(np.abs(a0[arm_idx] - state[arm_idx])))
-                tail_vs_a0_arm = float(np.max(np.abs(a0[arm_idx] - last_chunk_tail[arm_idx])))
-                state_vs_a0_grip_l = float(abs(a0[6]  - state[6]))
-                state_vs_a0_grip_r = float(abs(a0[13] - state[13]))
-                boundary_idx += 1
+                # Per-query diagnostic on the CURRENT actions (which we are
+                # about to apply). Use next_state, the arm's actual position
+                # right now, so the |a[i]-state| numbers tell us about the
+                # action we're about to send.
+                def _arm_delta_max_async(a_idx: int) -> float:
+                    d = actions[a_idx] - next_state
+                    return float(max(np.max(np.abs(d[:6])), np.max(np.abs(d[7:13]))))
+                a0_d  = _arm_delta_max_async(0)
+                a5_d  = _arm_delta_max_async(min(5, actions.shape[0]-1))
+                a10_d = _arm_delta_max_async(min(10, actions.shape[0]-1))
+                a19_d = _arm_delta_max_async(min(19, actions.shape[0]-1))
+                a29_d = _arm_delta_max_async(actions.shape[0]-1)
+                horizon_range = (actions.max(axis=0) - actions.min(axis=0))
+                horizon_arm_span = float(max(np.max(horizon_range[:6]),
+                                              np.max(horizon_range[7:13])))
                 log.info(
-                    "[boundary] #%d  state_vs_a0(arm)=%.3f rad  "
-                    "tail_vs_a0(arm)=%.3f rad  "
-                    "state_vs_a0(grip L,R)=%.2f,%.2f",
-                    boundary_idx, state_vs_a0_arm, tail_vs_a0_arm,
-                    state_vs_a0_grip_l, state_vs_a0_grip_r,
+                    "/act rtt=%dms  arm |a[i]-state|_max @ i=0/5/10/19/29: %.3f/%.3f/%.3f/%.3f/%.3f rad  "
+                    "horizon_span=%.3f rad  L_grip[0,29]=%.2f,%.2f  R_grip[0,29]=%.2f,%.2f",
+                    rtt_ms, a0_d, a5_d, a10_d, a19_d, a29_d, horizon_arm_span,
+                    actions[0][6],  actions[-1][6],
+                    actions[0][13], actions[-1][13],
                 )
 
-            # Count joints clipped across this stride. Useful for tuning
-            # --max-step-rad: if "clipped" is consistently >0 you're capping
-            # legitimate motion; if it stays 0, your cap is loose enough.
-            clipped_this_query = 0
-            steps_this_query = 0
-            for i in range(n_to_play):
-                if stop_flag["stop"]:
+                stride = max(1, args.horizon_stride)
+                n_to_play = min(stride, actions.shape[0] - chunk_start_idx)
+                if n_to_play <= 0:
+                    log.warning("Async: chunk too short (shape=%s, chunk_start_idx=%d)",
+                                actions.shape, chunk_start_idx)
                     break
-                step_start = time.perf_counter()
-                desired = actions[i].astype(np.float32)
-                if args.dry_run:
-                    log.info("dry-run action[%d]: %s", i,
-                             np.array2string(desired, precision=3))
-                else:
-                    state = read_state(left, right)
-                    _, n_clipped = safe_command(left, right, state, desired,
-                                                args.max_step_rad, args.gripper_step)
-                    clipped_this_query += n_clipped
-                    steps_this_query += 1
-                # Pace inner loop at the policy's training cadence.
-                sleep_left = inner_dt - (time.perf_counter() - step_start)
-                if sleep_left > 0:
-                    time.sleep(sleep_left)
-                elif sleep_left < -0.050:
-                    # Only log severe overruns (>50ms = >1.5x the target tick).
-                    # Small overruns are USB-contention noise, harmless at our
-                    # arm command rates -- the motors lerp between sparser
-                    # position targets just fine.
-                    log.warning("inner step overrun by %.1f ms (target %.1f ms)",
-                                -sleep_left * 1000.0, inner_dt * 1000.0)
-            # Per-query clip telemetry: total clipped dims across this chunk.
-            # 14 dims × steps_this_query is the max possible. Logging here so
-            # it sits next to the /act diagnostics in the stdout stream.
-            if steps_this_query > 0 and (args.max_step_rad > 0 or args.gripper_step > 0):
-                max_possible = STATE_DIM * steps_this_query
-                pct = 100.0 * clipped_this_query / max_possible
-                if clipped_this_query > 0:
-                    log.info("clip: %d/%d dim-steps clipped (%.1f%%) "
-                             "[--max-step-rad=%.3f --gripper-step=%.3f]",
-                             clipped_this_query, max_possible, pct,
-                             args.max_step_rad, args.gripper_step)
+                _rr_log_inference(time.perf_counter() - loop_t0, actions,
+                                  executed_idx=chunk_start_idx, rtt_ms=rtt_ms,
+                                  horizon_arm_span=horizon_arm_span)
 
-            # Stash the last raw action we sent so the next iteration's
-            # boundary log can compute the discontinuity. Use the raw action
-            # (pre-clip) since we're measuring what the MODEL is producing,
-            # not what the safety clip allowed through.
-            if n_to_play > 0:
-                last_chunk_tail = actions[n_to_play - 1].astype(np.float32).copy()
+                # Boundary diagnostic. In async mode the "first applied action"
+                # is a[chunk_start_idx], not a[0]. Measure how it relates to
+                # the arm's current actual position. Big disagreement = jump.
+                if last_chunk_tail is not None:
+                    arm_idx = np.r_[0:6, 7:13]
+                    a_first = actions[chunk_start_idx]
+                    state_vs_first_arm = float(np.max(np.abs(a_first[arm_idx] - next_state[arm_idx])))
+                    tail_vs_first_arm = float(np.max(np.abs(a_first[arm_idx] - last_chunk_tail[arm_idx])))
+                    state_vs_first_grip_l = float(abs(a_first[6]  - next_state[6]))
+                    state_vs_first_grip_r = float(abs(a_first[13] - next_state[13]))
+                    boundary_idx += 1
+                    log.info(
+                        "[boundary] #%d  apply_idx=%d  state_vs_a[K](arm)=%.3f rad  "
+                        "tail_vs_a[K](arm)=%.3f rad  "
+                        "state_vs_a[K](grip L,R)=%.2f,%.2f",
+                        boundary_idx, chunk_start_idx, state_vs_first_arm, tail_vs_first_arm,
+                        state_vs_first_grip_l, state_vs_first_grip_r,
+                    )
+
+                # Execute actions[chunk_start_idx : chunk_start_idx+n_to_play]
+                clipped_this_query = 0
+                steps_this_query = 0
+                for i in range(n_to_play):
+                    if stop_flag["stop"]:
+                        break
+                    step_start = time.perf_counter()
+                    action_idx = chunk_start_idx + i
+                    desired = actions[action_idx].astype(np.float32)
+                    if args.dry_run:
+                        log.info("dry-run action[%d]: %s", action_idx,
+                                 np.array2string(desired, precision=3))
+                    else:
+                        state = read_state(left, right)
+                        _, n_clipped = safe_command(left, right, state, desired,
+                                                    args.max_step_rad, args.gripper_step)
+                        clipped_this_query += n_clipped
+                        steps_this_query += 1
+                    sleep_left = inner_dt - (time.perf_counter() - step_start)
+                    if sleep_left > 0:
+                        time.sleep(sleep_left)
+                    elif sleep_left < -0.050:
+                        log.warning("inner step overrun by %.1f ms (target %.1f ms)",
+                                    -sleep_left * 1000.0, inner_dt * 1000.0)
+                if steps_this_query > 0 and (args.max_step_rad > 0 or args.gripper_step > 0):
+                    max_possible = STATE_DIM * steps_this_query
+                    pct = 100.0 * clipped_this_query / max_possible
+                    if clipped_this_query > 0:
+                        log.info("clip: %d/%d dim-steps clipped (%.1f%%) "
+                                 "[--max-step-rad=%.3f --gripper-step=%.3f]",
+                                 clipped_this_query, max_possible, pct,
+                                 args.max_step_rad, args.gripper_step)
+
+                # Stash the last raw action we applied so the next boundary
+                # check can compute the discontinuity.
+                last_chunk_tail = actions[chunk_start_idx + n_to_play - 1].astype(np.float32).copy()
+
+                # Wait for the in-flight chunk (the one we kicked off at the
+                # top of this iteration). If RTT < stride*dt this returns
+                # immediately; otherwise we wait the residual latency.
+                actions, rtt_ms = fetcher.wait_for_result()
+
+        else:
+            # =====================================================================
+            # SYNC INFERENCE PATH (default, the original behavior)
+            # =====================================================================
+            while not stop_flag["stop"]:
+                state = read_state(left, right)
+                top_img = top.grab()
+                left_img = cam_l.grab()
+                right_img = cam_r.grab()
+                _rr_log_observation(time.perf_counter() - loop_t0,
+                                    top_img, left_img, right_img, state)
+
+                # One-shot frame-dump for visual debugging. Run with --dump-frames /tmp/foo
+                # then inspect /tmp/foo/top.png / left.png / right.png to see exactly what
+                # the model is being shown. NOTE: don't re-import os here; it's already at
+                # module level. A local `import os` inside this block would shadow it and
+                # break the finally's os._exit(0) call when dump-frames is NOT set.
+                if args.dump_frames:
+                    import cv2
+                    os.makedirs(args.dump_frames, exist_ok=True)
+                    for name, img in [("top", top_img), ("left", left_img), ("right", right_img)]:
+                        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                        out_path = os.path.join(args.dump_frames, f"{name}.png")
+                        cv2.imwrite(out_path, bgr)
+                        log.info("dumped %s (%dx%d) to %s", name, img.shape[1], img.shape[0], out_path)
+                    log.info("dump-frames mode -- exiting before any inference.")
+                    sys.stdout.flush()
+                    os._exit(0)
+
+                actions, rtt_ms = post_actions(
+                    args.server_url, top_img, left_img, right_img, state,
+                    args.instruction, args.num_steps, args.timeout_s,
+                )
+
+                # Per-query diagnostic: what is the model actually asking for?
+                # We log:
+                #   - |action[i]-state|_max for i in {0, 5, 10, 19, 29} (arm joints only)
+                #     -> shows WHERE in the horizon the model wants to move
+                #   - horizon span(arm) -> max-min across all 30 actions
+                # If |a[29]-state| is large but |a[0..19]-state| is small, the model
+                # plans motion AFTER the stride cutoff and we never execute it.
+                def _arm_delta_max(a_idx: int) -> float:
+                    d = actions[a_idx] - state
+                    return float(max(np.max(np.abs(d[:6])), np.max(np.abs(d[7:13]))))
+                a0_d  = _arm_delta_max(0)
+                a5_d  = _arm_delta_max(min(5,  actions.shape[0]-1))
+                a10_d = _arm_delta_max(min(10, actions.shape[0]-1))
+                a19_d = _arm_delta_max(min(19, actions.shape[0]-1))
+                a29_d = _arm_delta_max(actions.shape[0]-1)
+                horizon_range = (actions.max(axis=0) - actions.min(axis=0))
+                horizon_arm_span = float(max(np.max(horizon_range[:6]),
+                                              np.max(horizon_range[7:13])))
+                log.info(
+                    "/act rtt=%dms  arm |a[i]-state|_max @ i=0/5/10/19/29: %.3f/%.3f/%.3f/%.3f/%.3f rad  "
+                    "horizon_span=%.3f rad  L_grip[0,29]=%.2f,%.2f  R_grip[0,29]=%.2f,%.2f",
+                    rtt_ms, a0_d, a5_d, a10_d, a19_d, a29_d, horizon_arm_span,
+                    actions[0][6],  actions[-1][6],
+                    actions[0][13], actions[-1][13],
+                )
+
+                stride = max(1, args.horizon_stride)
+                n_to_play = min(stride, actions.shape[0])
+                _rr_log_inference(time.perf_counter() - loop_t0, actions,
+                                  executed_idx=0, rtt_ms=rtt_ms,
+                                  horizon_arm_span=horizon_arm_span)
+
+                # Chunk-boundary telemetry. Two quantities:
+                #   state_vs_a0: |new_chunk.a[0] - current_arm_state|, max over 12
+                #                arm joints. Tells us how much the arm would
+                #                "jump" if we naively apply a[0] right now.
+                #   tail_vs_a0:  |new_chunk.a[0] - prev_chunk.a[stride-1]|, max
+                #                over 12 arm joints. Tells us how big the
+                #                discontinuity is between the model's last
+                #                command and the model's next command.
+                # In sync, state_vs_a0 should be small (arm held during POST).
+                # In naive async, state_vs_a0 will spike because the arm moved
+                # during POST but the model planned from a stale state.
+                if last_chunk_tail is not None:
+                    arm_idx = np.r_[0:6, 7:13]
+                    a0 = actions[0]
+                    state_vs_a0_arm = float(np.max(np.abs(a0[arm_idx] - state[arm_idx])))
+                    tail_vs_a0_arm = float(np.max(np.abs(a0[arm_idx] - last_chunk_tail[arm_idx])))
+                    state_vs_a0_grip_l = float(abs(a0[6]  - state[6]))
+                    state_vs_a0_grip_r = float(abs(a0[13] - state[13]))
+                    boundary_idx += 1
+                    log.info(
+                        "[boundary] #%d  state_vs_a0(arm)=%.3f rad  "
+                        "tail_vs_a0(arm)=%.3f rad  "
+                        "state_vs_a0(grip L,R)=%.2f,%.2f",
+                        boundary_idx, state_vs_a0_arm, tail_vs_a0_arm,
+                        state_vs_a0_grip_l, state_vs_a0_grip_r,
+                    )
+
+                # Count joints clipped across this stride. Useful for tuning
+                # --max-step-rad: if "clipped" is consistently >0 you're capping
+                # legitimate motion; if it stays 0, your cap is loose enough.
+                clipped_this_query = 0
+                steps_this_query = 0
+                for i in range(n_to_play):
+                    if stop_flag["stop"]:
+                        break
+                    step_start = time.perf_counter()
+                    desired = actions[i].astype(np.float32)
+                    if args.dry_run:
+                        log.info("dry-run action[%d]: %s", i,
+                                 np.array2string(desired, precision=3))
+                    else:
+                        state = read_state(left, right)
+                        _, n_clipped = safe_command(left, right, state, desired,
+                                                    args.max_step_rad, args.gripper_step)
+                        clipped_this_query += n_clipped
+                        steps_this_query += 1
+                    # Pace inner loop at the policy's training cadence.
+                    sleep_left = inner_dt - (time.perf_counter() - step_start)
+                    if sleep_left > 0:
+                        time.sleep(sleep_left)
+                    elif sleep_left < -0.050:
+                        # Only log severe overruns (>50ms = >1.5x the target tick).
+                        # Small overruns are USB-contention noise, harmless at our
+                        # arm command rates -- the motors lerp between sparser
+                        # position targets just fine.
+                        log.warning("inner step overrun by %.1f ms (target %.1f ms)",
+                                    -sleep_left * 1000.0, inner_dt * 1000.0)
+                # Per-query clip telemetry: total clipped dims across this chunk.
+                # 14 dims × steps_this_query is the max possible. Logging here so
+                # it sits next to the /act diagnostics in the stdout stream.
+                if steps_this_query > 0 and (args.max_step_rad > 0 or args.gripper_step > 0):
+                    max_possible = STATE_DIM * steps_this_query
+                    pct = 100.0 * clipped_this_query / max_possible
+                    if clipped_this_query > 0:
+                        log.info("clip: %d/%d dim-steps clipped (%.1f%%) "
+                                 "[--max-step-rad=%.3f --gripper-step=%.3f]",
+                                 clipped_this_query, max_possible, pct,
+                                 args.max_step_rad, args.gripper_step)
+
+                # Stash the last raw action we sent so the next iteration's
+                # boundary log can compute the discontinuity. Use the raw action
+                # (pre-clip) since we're measuring what the MODEL is producing,
+                # not what the safety clip allowed through.
+                if n_to_play > 0:
+                    last_chunk_tail = actions[n_to_play - 1].astype(np.float32).copy()
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt -- shutting down")
     finally:
