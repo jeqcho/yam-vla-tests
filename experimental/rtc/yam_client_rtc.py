@@ -106,12 +106,17 @@ def post_actions_rtc(
     prev_chunk_left_over: Optional[np.ndarray],
     inference_delay: int,
     execution_horizon: int,
+    max_guidance_weight: Optional[float] = None,
+    schedule: Optional[str] = None,
+    debug: bool = False,
+    seed: Optional[int] = None,
 ) -> tuple[np.ndarray, float, dict]:
     """Round-trip one RTC /act call. Returns (actions[N, D], rtt_ms, server_meta).
 
     server_meta is the 'rtc' field from the server response (echoes back the
-    leftover_len_in / execution_horizon / inference_delay / num_steps so the
-    client can sanity-check what the server actually applied).
+    leftover_len_in / execution_horizon / inference_delay / num_steps / the
+    actual max_guidance_weight + schedule used / seed so the client can
+    sanity-check what the server actually applied).
     """
     payload = {
         "top_cam": top,
@@ -128,6 +133,17 @@ def post_actions_rtc(
         payload["prev_chunk_left_over"] = np.asarray(
             prev_chunk_left_over, dtype=np.float32
         )
+    # Optional per-request RTC hyperparameter overrides. Each is omitted if
+    # None; the server uses its boot-time RTCConfig defaults for any missing
+    # field.
+    if max_guidance_weight is not None:
+        payload["max_guidance_weight"] = float(max_guidance_weight)
+    if schedule is not None:
+        payload["prefix_attention_schedule"] = str(schedule)
+    if debug:
+        payload["debug"] = True
+    if seed is not None:
+        payload["seed"] = int(seed)
     body = json_numpy.dumps(payload)
     t0 = time.perf_counter()
     resp = requests.post(
@@ -177,6 +193,10 @@ class AsyncRTCFetcher:
         prev_chunk_left_over: Optional[np.ndarray],
         inference_delay: int,
         execution_horizon: int,
+        max_guidance_weight: Optional[float] = None,
+        schedule: Optional[str] = None,
+        debug: bool = False,
+        seed: Optional[int] = None,
     ) -> None:
         if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("AsyncRTCFetcher: previous request still in flight")
@@ -190,6 +210,10 @@ class AsyncRTCFetcher:
             pcl = np.ascontiguousarray(prev_chunk_left_over, dtype=np.float32).copy()
         idelay = int(inference_delay)
         exh = int(execution_horizon)
+        mgw = float(max_guidance_weight) if max_guidance_weight is not None else None
+        sched = schedule
+        dbg = bool(debug)
+        seed_v = int(seed) if seed is not None else None
 
         self._result = None
         self._error = None
@@ -199,6 +223,8 @@ class AsyncRTCFetcher:
                 actions, rtt_ms, meta = post_actions_rtc(
                     self._url, t, l, r, s, self._instr, self._num_steps,
                     self._timeout_s, pcl, idelay, exh,
+                    max_guidance_weight=mgw, schedule=sched,
+                    debug=dbg, seed=seed_v,
                 )
                 self._result = (actions, rtt_ms, meta)
             except BaseException as e:  # noqa: BLE001
@@ -298,6 +324,31 @@ def main() -> None:
         "--inference-delay-ema-alpha", type=float, default=0.5,
         help="EMA smoothing factor for the RTT estimate (0..1, higher = "
              "more reactive to recent latency).",
+    )
+    p.add_argument(
+        "--rtc-max-guidance-weight", type=float, default=None,
+        help="Per-request override for RTCConfig.max_guidance_weight. If "
+             "unset, uses the server's RTCConfig default (10.0). Higher = "
+             "tighter prefix anchoring; lower = more model freedom near "
+             "chunk boundaries.",
+    )
+    p.add_argument(
+        "--rtc-schedule", default=None, choices=[None, "linear", "exp", "zeros", "ones"],
+        help="Per-request override for prefix_attention_schedule. If unset, "
+             "uses the server's default (LINEAR, the paper's recommendation).",
+    )
+    p.add_argument(
+        "--rtc-debug", action="store_true",
+        help="Set RTCConfig.debug=True for each request, so the server's "
+             "tracker records per-step intermediate state. Useful when "
+             "something looks wrong; off by default for speed.",
+    )
+    p.add_argument(
+        "--seed", type=int, default=None,
+        help="If set, each /act call uses a torch.Generator seeded with "
+             "this value for deterministic flow-matching initial noise. "
+             "Useful for debugging; in production leave unset for diverse "
+             "rollouts.",
     )
     # ----- ramp / safety --------------------------------------------------
     p.add_argument("--move-to-ready", action="store_true",
@@ -485,6 +536,10 @@ def main() -> None:
         bootstrap_state, bootstrap_top, bootstrap_left, bootstrap_right,
         prev_chunk_left_over=None, inference_delay=0,
         execution_horizon=args.execution_horizon,
+        max_guidance_weight=args.rtc_max_guidance_weight,
+        schedule=args.rtc_schedule,
+        debug=args.rtc_debug,
+        seed=args.seed,
     )
     current_chunk, last_rtt_ms, last_meta = fetcher.wait_for_result()
     rtt_ema_ms = float(last_rtt_ms)
@@ -580,6 +635,10 @@ def main() -> None:
                     prev_chunk_left_over=leftover,
                     inference_delay=inference_delay,
                     execution_horizon=exec_horizon,
+                    max_guidance_weight=args.rtc_max_guidance_weight,
+                    schedule=args.rtc_schedule,
+                    debug=args.rtc_debug,
+                    seed=args.seed,
                 )
             except RuntimeError as e:
                 log.error("kick_off failed: %s", e)

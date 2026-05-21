@@ -229,11 +229,71 @@ class RTCPolicy:
         )
         log.info("Processors ready in %.1fs", time.perf_counter() - t0)
 
+        # Verify the constants we hardcoded against what the checkpoint
+        # actually says. If anyone retrains with different camera keys /
+        # setup_type / control_mode / chunk_size, we fail loud here
+        # rather than silently producing garbage embeddings.
+        self._verify_norm_stats_consistency()
+
         self.device = device
         self.dtype = dtype
         # Coarse serialization: predict_action_chunk isn't safe under
         # concurrent calls (CUDA graph capture / action expert state).
         self._lock = threading.Lock()
+
+    def _verify_norm_stats_consistency(self) -> None:
+        """Load norm_stats.json from the resolved HF snapshot and assert that
+        the camera_keys / setup_type / control_mode / chunk_size we hardcoded
+        match what's actually stored under our norm_tag. If they don't, the
+        preprocessor and the model would silently disagree on what each
+        observation key means; the model output would be garbage embeddings.
+        Fail loud at startup instead.
+        """
+        import json
+        from huggingface_hub import snapshot_download as _snap
+        local_dir = _snap(repo_id=REPO_ID)
+        ns_path = os.path.join(local_dir, "norm_stats.json")
+        with open(ns_path, "r", encoding="utf-8") as f:
+            ns = json.load(f)
+        tag_meta = ns.get("metadata_by_tag", {}).get(NORM_TAG)
+        if tag_meta is None:
+            raise RuntimeError(
+                f"norm_stats.json has no metadata for tag {NORM_TAG!r}; "
+                f"available: {list(ns.get('metadata_by_tag', {}).keys())}"
+            )
+        problems = []
+        if tag_meta.get("camera_keys") != CAMERA_KEYS:
+            problems.append(
+                f"camera_keys mismatch: hardcoded={CAMERA_KEYS} "
+                f"checkpoint={tag_meta.get('camera_keys')}"
+            )
+        if tag_meta.get("setup_type") != SETUP_TYPE:
+            problems.append(
+                f"setup_type mismatch: hardcoded={SETUP_TYPE!r} "
+                f"checkpoint={tag_meta.get('setup_type')!r}"
+            )
+        if tag_meta.get("control_mode") != CONTROL_MODE:
+            problems.append(
+                f"control_mode mismatch: hardcoded={CONTROL_MODE!r} "
+                f"checkpoint={tag_meta.get('control_mode')!r}"
+            )
+        if int(tag_meta.get("action_horizon") or 0) != CHUNK_SIZE:
+            problems.append(
+                f"action_horizon mismatch: hardcoded={CHUNK_SIZE} "
+                f"checkpoint={tag_meta.get('action_horizon')}"
+            )
+        if problems:
+            raise RuntimeError(
+                "Hardcoded server constants disagree with checkpoint "
+                "norm_stats.json:\n  - " + "\n  - ".join(problems) +
+                f"\nFix host_server_rtc.py constants to match the values in "
+                f"{ns_path} (metadata_by_tag.{NORM_TAG})."
+            )
+        log.info(
+            "Verified hardcoded constants against checkpoint norm_stats.json: "
+            "camera_keys=%s, setup_type=%r, control_mode=%r, action_horizon=%d",
+            CAMERA_KEYS, SETUP_TYPE, CONTROL_MODE, CHUNK_SIZE,
+        )
 
     # NOTE: NO @torch.inference_mode() / @torch.no_grad() decorator.
     # RTC's denoise_step calls torch.autograd.grad to compute a correction
@@ -254,6 +314,8 @@ class RTCPolicy:
         prev_chunk_left_over: np.ndarray | None = None,
         inference_delay: int = 0,
         execution_horizon: int = 10,
+        rtc_overrides: dict | None = None,
+        seed: int | None = None,
     ) -> tuple[np.ndarray, dict]:
         """Run one RTC-augmented inference. Returns (actions[CHUNK_SIZE,14], meta).
 
@@ -263,7 +325,16 @@ class RTCPolicy:
               "execution_horizon": int,
               "inference_delay": int,
               "num_steps": int,
+              "max_guidance_weight": float (the value used for this request),
+              "schedule": str,
             }
+
+        rtc_overrides: optional dict of RTCConfig fields to override for this
+        request only (max_guidance_weight, prefix_attention_schedule, debug).
+        Mutated in place under self._lock; restored after the call.
+
+        seed: if non-None, builds a torch.Generator with this seed for
+        deterministic flow-matching initial noise.
         """
         state_f32 = np.asarray(state, dtype=np.float32).reshape(-1)
         if state_f32.shape != (STATE_DIM,):
@@ -304,21 +375,53 @@ class RTCPolicy:
                     torch.from_numpy(pcl).to(self.device).unsqueeze(0)
                 )
 
-            # Run the policy with RTC kwargs. inference_action_mode must be
-            # set explicitly; "continuous" matches what the BimanualYAM
-            # checkpoint was trained for (flow-matching expert).
-            action_chunk = self.policy.predict_action_chunk(
-                batch,
-                num_steps=int(num_steps),
-                inference_delay=int(inference_delay) if inference_delay else None,
-                prev_chunk_left_over=prev_chunk_tensor,
-                execution_horizon=int(execution_horizon),
-                inference_action_mode="continuous",
-            )
-            # action_chunk: (B, T, action_dim) before postprocessing. We push
-            # it through the postprocessor for unnormalization. The postproc
-            # takes a PolicyAction (a tensor).
-            actions_t = self.post(action_chunk)
+            # Apply per-request RTC overrides on the live config. The lock
+            # serializes /act calls so this mutation is safe. We snapshot
+            # the originals so we can restore even if predict raises.
+            saved = {}
+            if rtc_overrides:
+                for k, v in rtc_overrides.items():
+                    if not hasattr(self.rtc_config, k):
+                        continue
+                    saved[k] = getattr(self.rtc_config, k)
+                    if k == "prefix_attention_schedule" and isinstance(v, str):
+                        # Map string -> enum so the live config matches the
+                        # type get_prefix_weights branches on.
+                        try:
+                            from lerobot.policies.rtc.configuration_rtc import (
+                                RTCAttentionSchedule,
+                            )
+                            v = RTCAttentionSchedule[v.upper()]
+                        except (KeyError, ImportError):
+                            log.warning("unknown prefix_attention_schedule %r; "
+                                        "falling back to default", v)
+                            continue
+                    setattr(self.rtc_config, k, v)
+
+            # Optional deterministic seed for flow-matching noise init.
+            gen = None
+            if seed is not None:
+                gen = torch.Generator(device=self.device).manual_seed(int(seed))
+
+            try:
+                # Run the policy with RTC kwargs. inference_action_mode must
+                # be set explicitly; "continuous" matches what the BimanualYAM
+                # checkpoint was trained for (flow-matching expert).
+                action_chunk = self.policy.predict_action_chunk(
+                    batch,
+                    num_steps=int(num_steps),
+                    inference_delay=int(inference_delay) if inference_delay else None,
+                    prev_chunk_left_over=prev_chunk_tensor,
+                    execution_horizon=int(execution_horizon),
+                    inference_action_mode="continuous",
+                    generator=gen,
+                )
+                # action_chunk: (B, T, action_dim) before postprocessing.
+                actions_t = self.post(action_chunk)
+            finally:
+                # Restore the original RTCConfig values, even if predict raised.
+                for k, v in saved.items():
+                    setattr(self.rtc_config, k, v)
 
         # Convert back to numpy. Strip the batch dim.
         if torch.is_tensor(actions_t):
@@ -335,6 +438,15 @@ class RTCPolicy:
                 f"unexpected action shape from policy: {actions_np.shape}"
             )
 
+        # Capture the RTC params we actually used (after overrides). Echoing
+        # these back to the client lets it confirm the request was honored.
+        applied_max_guidance = float(rtc_overrides.get("max_guidance_weight",
+                                                       self.rtc_config.max_guidance_weight)) \
+            if rtc_overrides else float(self.rtc_config.max_guidance_weight)
+        applied_schedule = rtc_overrides.get("prefix_attention_schedule") \
+            if (rtc_overrides and "prefix_attention_schedule" in rtc_overrides) \
+            else str(self.rtc_config.prefix_attention_schedule).split(".")[-1].lower()
+
         meta = {
             "leftover_len_in": (
                 0 if prev_chunk_left_over is None else int(len(prev_chunk_left_over))
@@ -343,6 +455,9 @@ class RTCPolicy:
             "inference_delay": int(inference_delay),
             "num_steps": int(num_steps),
             "chunk_size": int(actions_np.shape[0]),
+            "max_guidance_weight": applied_max_guidance,
+            "schedule": str(applied_schedule).split(".")[-1].lower(),
+            "seed": seed,
         }
         return actions_np, meta
 
@@ -401,6 +516,19 @@ def build_app(policy: RTCPolicy, default_exec_horizon: int) -> FastAPI:
         execution_horizon = int(
             payload.get("execution_horizon", default_exec_horizon)
         )
+        # Per-request RTC hyperparameter overrides. Each is optional; if
+        # absent we use whatever was set in RTCConfig at server boot. They
+        # take effect only for this request (predict() restores afterwards).
+        rtc_overrides = {}
+        if "max_guidance_weight" in payload:
+            rtc_overrides["max_guidance_weight"] = float(payload["max_guidance_weight"])
+        if "prefix_attention_schedule" in payload:
+            rtc_overrides["prefix_attention_schedule"] = str(payload["prefix_attention_schedule"])
+        if "debug" in payload:
+            rtc_overrides["debug"] = bool(payload["debug"])
+        seed = payload.get("seed", None)
+        if seed is not None:
+            seed = int(seed)
 
         t0 = time.perf_counter()
         try:
@@ -414,6 +542,8 @@ def build_app(policy: RTCPolicy, default_exec_horizon: int) -> FastAPI:
                 prev_chunk_left_over=prev_left,
                 inference_delay=inference_delay,
                 execution_horizon=execution_horizon,
+                rtc_overrides=rtc_overrides,
+                seed=seed,
             )
         except Exception as e:  # noqa: BLE001
             log.exception("inference failed")
