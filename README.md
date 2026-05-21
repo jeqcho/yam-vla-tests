@@ -1,77 +1,89 @@
 # DreamZero on bimanual YAM — setup
 
-This folder lets you bring up [DreamZero](https://github.com/dreamzero0/dreamzero)
-on **remote H100s via Modal** and drive a local bimanual YAM rig against it.
-Inference is not local because DreamZero is a 14B WAM that needs ≥2 GPUs
-distributed; the YAM workstation has a single RTX 5090.
+Bring up [DreamZero](https://github.com/dreamzero0/dreamzero) on Modal H100s
+and drive a local bimanual YAM against it. Inference is remote because the 14B
+WAM is multi-GPU; the YAM workstation has a single RTX 5090.
 
-Two flavors:
+Transport: **`modal.forward()` Tunnels** ([per the Physical Intelligence / Modal
+blog post](https://modal.com/blog/physical-intelligence-runs-real-time-remote-inference-for-robotic-control-on-modal)).
+PI's custom QUIC portal isn't a public Modal feature; Tunnels are the next-best
+public path.
 
-| Flavor | Checkpoint | State today |
-|---|---|---|
-| **Vanilla** | [`GEAR-Dreams/DreamZero-DROID`](https://huggingface.co/GEAR-Dreams/DreamZero-DROID) | ✅ public; runnable today via Modal. Single-arm Franka schema — won't drive a bimanual YAM physically, but you can verify end-to-end inference, latency, and action stats. |
-| **YAM-finetuned** | `GEAR-Dreams/DreamZero-YAM-bimanual` (placeholder) | ❌ no public checkpoint. The paper's "30 minutes of YAM play data" result is reproducible via [`scripts/train/yam_training.sh`](dreamzero/scripts/train/yam_training.sh); we ship a Modal launcher for that fine-tune. |
-
-## One-command smoke test (vanilla DROID)
+## One command to test inference
 
 ```bash
-# Terminal A — bring up the Modal server (prints a wss:// URL in the banner)
-./scripts/run_modal_server.sh droid
-
-# Terminal B — synthetic-frame round-trip against that URL
-uv sync
-uv run python scripts/smoke_test_remote.py \
-    --url wss://<your-workspace>--dreamzero-droid-serve.modal.run \
-    --schema droid --rounds 5
+./scripts/run_inference.sh droid
 ```
 
-Expected output: per-round `action shape=(N, 8)` with finite values and an RTT
-on the order of 3 s on H100 (per the model card).
+That:
+1. Cold-starts `GEAR-Dreams/DreamZero-DROID` on Modal H100:2 (~10 min first time).
+2. Waits for the `modal.forward()` tunnel URL.
+3. Hits it with 3 synthetic-frame inference rounds via `scripts/smoke_test_remote.py`.
+4. Prints ✅ and tears down (pass `--keep` to leave the server up for further pokes).
 
-## Drive a real bimanual YAM (requires a YAM-finetuned checkpoint)
+## Two flavors
 
-Once you have a DreamZero checkpoint finetuned on bimanual YAM:
+| Flavor | Checkpoint | Status |
+|---|---|---|
+| **Vanilla** | [`GEAR-Dreams/DreamZero-DROID`](https://huggingface.co/GEAR-Dreams/DreamZero-DROID) | Public, runnable today. Single-arm Franka schema. Probe-only on a bimanual YAM. |
+| **YAM-finetuned** | (will be) `<your-org>/DreamZero-YAM-v1` | No public checkpoint exists. Fine-tune via `./scripts/run_finetune_modal.sh`. |
+
+## YAM fine-tune workflow
 
 ```bash
-# 1. Edit modal/dreamzero_server.py:CHECKPOINTS["yam"] to point at it,
-#    or pass it via env: YAM_REPO_ID=org/your-checkpoint
-./scripts/run_modal_server.sh yam
+# 1. Prep an Ai2 BimanualYAM subset (v3 → v2 layout + GEAR meta).  ~30–45 min, ~$0.20.
+modal run modal/prepare_yam_data.py::prepare --hf-repo allenai/01122025-box-01 --tag yam_box_smoke
 
-# 2. From the YAM workstation (with the i2rt venv as interpreter):
+# 2. Pull the deliverables and eyeball them.
+./scripts/inspect_prep.sh yam_box_smoke
+cat hf-cache/prep_yam_box_smoke/yam_box_smoke_prep_report.md
+
+# 3. Smoke fine-tune to validate the training pipeline (200 steps, ~$10).
+./scripts/run_finetune_modal.sh yam_box_smoke dz-yam-smoke 200
+
+# 4. Full fine-tune (100k steps, ~$150-$200, ~12 hr on H100:4).
+./scripts/run_finetune_modal.sh yam_box_smoke dz-yam-v1 100000
+
+# 5. Pull the checkpoint and upload to HF.
+modal volume get -r dreamzero-finetune-out dz-yam-v1 ./hf-cache/
+
+# 6. Serve it.
+YAM_REPO_ID=<your-org>/DreamZero-YAM-v1 ./scripts/run_inference.sh yam
+```
+
+## Drive a real bimanual YAM (after a YAM checkpoint exists)
+
+From the YAM workstation:
+
+```bash
 /home/andon/yam-tests/i2rt/.venv/bin/python scripts/dreamzero_yam_client.py \
-    --url wss://<…>-dreamzero-yam-serve.modal.run \
+    --url wss://<...>-dreamzero-yam-serve.modal.run/ \
     --left-can can0 --right-can can1 \
     --left-gripper linear_4310 --right-gripper linear_4310 \
-    --top-cam-serial <S1> --left-cam-serial <S2> --right-cam-serial <S3> \
-    --instruction "pick up the orange cube on the left and put it in the box" \
-    --dry-run         # mandatory until you've inspected the actions
+    --top-cam-serial X --left-cam-serial Y --right-cam-serial Z \
+    --instruction "place all snack packets into the box and close the lid" \
+    --train-fps 30 --horizon-stride 6 \
+    --max-step-rad 0.05 --gripper-step 0.05 \
+    --dry-run
 ```
 
-## Fine-tune YAM-bimanual from DreamZero-AgiBot
-
-```bash
-# Stage data + checkpoints + run yam_training.sh on 4×H100. Budget ~$150 for
-# a full 100k-step run; pass a small --max-steps for a smoke run first.
-./scripts/run_finetune_modal.sh <hf-dataset-id> dreamzero_yam_run1 200
-```
-
-See `REPORT_dreamzero_setup.md` for the modality schema the dataset must
-expose and how to crosswalk Ai2's `MolmoAct2-BimanualYAM` data into it.
+Defaults to `--dry-run`; pass `--no-dry-run` once the action chunks look sane.
 
 ## Layout
 
 ```
 dreamzero exploration/
-├── dreamzero/                # cloned dreamzero0/dreamzero (untracked)
+├── dreamzero/                       # cloned upstream (untracked)
 ├── modal/
-│   ├── dreamzero_server.py   # WebSocket policy server on Modal H100s
-│   └── dreamzero_finetune.py # yam_training.sh wrapper on Modal H100s
+│   ├── dreamzero_server.py          # H100:2 WebSocket server via modal.forward()
+│   ├── dreamzero_finetune.py        # H100:4 yam_training.sh wrapper
+│   └── prepare_yam_data.py          # v3→v2 + GEAR-meta data prep job
 ├── scripts/
-│   ├── run_modal_server.sh
-│   ├── run_finetune_modal.sh
-│   ├── smoke_test_remote.py
-│   └── dreamzero_yam_client.py
-├── pyproject.toml            # local venv: msgpack/websockets/modal/i2rt-compat
-├── .python-version           # 3.11
-└── README.md, HANDOFF.md
+│   ├── run_inference.sh             # ★ one-command inference test
+│   ├── run_finetune_modal.sh        # fine-tune launcher
+│   ├── inspect_prep.sh              # pull prep artifacts down for inspection
+│   ├── smoke_test_remote.py         # synthetic-frame WebSocket smoke test
+│   └── dreamzero_yam_client.py      # i2rt+RealSense hardware client
+├── pyproject.toml                   # local-only deps (modal, websockets, msgpack)
+├── README.md, HANDOFF.md
 ```

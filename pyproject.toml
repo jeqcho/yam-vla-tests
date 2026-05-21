@@ -19,6 +19,8 @@ dependencies = [
     "requests",
     "tyro",
     "openpi-client==0.1.1",  # matches dreamzero/pyproject.toml pin so wire format stays compatible
+    "pandas>=3.0.3",
+    "pyarrow>=24.0.0",
 ]
 
 [tool.uv]
