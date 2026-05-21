@@ -866,6 +866,15 @@ def main() -> None:
     # the viewer's time axis is stable even if the system clock jumps.
     loop_t0 = time.perf_counter()
 
+    # Chunk-boundary telemetry (Phase 1 of async refactor): track the last raw
+    # action of the previous chunk so we can log the discontinuity at every
+    # chunk transition. In sync mode the discontinuity should be small (arm
+    # holds during POST, model's a[0] of new chunk approx equals state approx
+    # equals previous chunk's a[stride-1]). In naive async it will spike. In
+    # time-aligned async it should return to the sync baseline.
+    last_chunk_tail: Optional[np.ndarray] = None
+    boundary_idx = 0
+
     try:
         while not stop_flag["stop"]:
             state = read_state(left, right)
@@ -928,6 +937,34 @@ def main() -> None:
             _rr_log_inference(time.perf_counter() - loop_t0, actions,
                               executed_idx=0, rtt_ms=rtt_ms,
                               horizon_arm_span=horizon_arm_span)
+
+            # Chunk-boundary telemetry. Two quantities:
+            #   state_vs_a0: |new_chunk.a[0] - current_arm_state|, max over 12
+            #                arm joints. Tells us how much the arm would
+            #                "jump" if we naively apply a[0] right now.
+            #   tail_vs_a0:  |new_chunk.a[0] - prev_chunk.a[stride-1]|, max
+            #                over 12 arm joints. Tells us how big the
+            #                discontinuity is between the model's last
+            #                command and the model's next command.
+            # In sync, state_vs_a0 should be small (arm held during POST).
+            # In naive async, state_vs_a0 will spike because the arm moved
+            # during POST but the model planned from a stale state.
+            if last_chunk_tail is not None:
+                arm_idx = np.r_[0:6, 7:13]
+                a0 = actions[0]
+                state_vs_a0_arm = float(np.max(np.abs(a0[arm_idx] - state[arm_idx])))
+                tail_vs_a0_arm = float(np.max(np.abs(a0[arm_idx] - last_chunk_tail[arm_idx])))
+                state_vs_a0_grip_l = float(abs(a0[6]  - state[6]))
+                state_vs_a0_grip_r = float(abs(a0[13] - state[13]))
+                boundary_idx += 1
+                log.info(
+                    "[boundary] #%d  state_vs_a0(arm)=%.3f rad  "
+                    "tail_vs_a0(arm)=%.3f rad  "
+                    "state_vs_a0(grip L,R)=%.2f,%.2f",
+                    boundary_idx, state_vs_a0_arm, tail_vs_a0_arm,
+                    state_vs_a0_grip_l, state_vs_a0_grip_r,
+                )
+
             # Count joints clipped across this stride. Useful for tuning
             # --max-step-rad: if "clipped" is consistently >0 you're capping
             # legitimate motion; if it stays 0, your cap is loose enough.
@@ -969,6 +1006,13 @@ def main() -> None:
                              "[--max-step-rad=%.3f --gripper-step=%.3f]",
                              clipped_this_query, max_possible, pct,
                              args.max_step_rad, args.gripper_step)
+
+            # Stash the last raw action we sent so the next iteration's
+            # boundary log can compute the discontinuity. Use the raw action
+            # (pre-clip) since we're measuring what the MODEL is producing,
+            # not what the safety clip allowed through.
+            if n_to_play > 0:
+                last_chunk_tail = actions[n_to_play - 1].astype(np.float32).copy()
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt -- shutting down")
     finally:
