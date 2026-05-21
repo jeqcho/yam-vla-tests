@@ -1016,6 +1016,19 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt -- shutting down")
     finally:
+        # Research journal goes FIRST so a Ctrl-C during cleanup can't skip
+        # it. Motors are still in position-hold mode from the last commanded
+        # action -- they will hold (not drift) for the seconds the user
+        # spends answering. We have NOT yet installed the cleanup SIGINT
+        # handler, so SIGINT here uses Python's default behavior and raises
+        # KeyboardInterrupt, which prompt_journal_entry catches as 'skip'.
+        try:
+            entry = prompt_journal_entry(journal_start_s, args)
+            if entry is not None:
+                write_journal_entry(args.journal_path, entry, args, journal_invocation)
+        except Exception as e:
+            log.warning("journal step failed: %s", e)
+
         # SAFETY: Before disabling motors we ramp arms back to startup_pose
         # so they end up where the user knows they can be safely de-powered.
         # close() zeros torques -> arms fall under gravity -> ARMS DROP.
@@ -1084,18 +1097,6 @@ def main() -> None:
         log.info("Arms returned to startup pose and motors disabled.")
         sys.stdout.flush()
         sys.stderr.flush()
-
-        # Research journal: prompt user for run notes and append to journal.md.
-        # Done AFTER motors are safely down so the user isn't pressed to answer
-        # while the arms might still be holding. Failures in the journal step
-        # must not prevent process exit -- wrap in broad except.
-        try:
-            entry = prompt_journal_entry(journal_start_s, args)
-            if entry is not None:
-                write_journal_entry(args.journal_path, entry, args, journal_invocation)
-        except Exception as e:
-            log.warning("journal step failed: %s", e)
-
         os._exit(0)
 
 
