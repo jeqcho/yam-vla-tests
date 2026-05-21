@@ -15,7 +15,7 @@ cd "$DEST"
 
 echo "Pulling artifacts for tag=${TAG} into $DEST ..."
 modal volume get --force dreamzero-yam-data "prepared/${TAG}_prep_report.md" .  || true
-modal volume get --force -r dreamzero-yam-data "prepared/sample_frames" .       || true
+modal volume get --force dreamzero-yam-data "prepared/sample_frames" .          || true
 modal volume get --force dreamzero-yam-data "prepared/${TAG}/meta/modality.json" .   || true
 modal volume get --force dreamzero-yam-data "prepared/${TAG}/meta/embodiment.json" . || true
 modal volume get --force dreamzero-yam-data "prepared/${TAG}/meta/stats.json" .      || true
