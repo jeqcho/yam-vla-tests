@@ -630,9 +630,43 @@ def main() -> None:
         log.error("server health check failed at %s: %s", health_url, e)
         sys.exit(2)
 
-    # Init arms first (will fail loud if CAN/hardware is wrong).
+    # Cameras BEFORE arms. The D405 USB-3 enumeration storm and the CAN
+    # adapters share the same Intel xHCI controller (PCI 0000:80:14.0, IRQ
+    # 138). When pyrealsense2 starts a D405 pipeline AFTER motors are
+    # already taking commands at 30 Hz, the burst of USB control transfers
+    # delays gs_usb URBs long enough to trip the DM motor watchdog
+    # ("loss communication on motor X"). Initializing cameras first means
+    # the USB storm is over by the time the motor control thread spins up,
+    # so there is nothing to time out.
     left: Optional[Robot] = None
     right: Optional[Robot] = None
+    top = cam_l = cam_r = None
+    try:
+        cam_kw = dict(width=args.cam_width, height=args.cam_height, fps=args.cam_fps)
+        trace(f"building cameras at {args.cam_width}x{args.cam_height}/{args.cam_fps}fps")
+        top   = make_camera("top",   args.top_cam_serial,   args.top_cam_v4l2,   **cam_kw)
+        cam_l = make_camera("left",  args.left_cam_serial,  args.left_cam_v4l2,  **cam_kw)
+        cam_r = make_camera("right", args.right_cam_serial, args.right_cam_v4l2, **cam_kw)
+        for c in (top, cam_l, cam_r):
+            trace(f"starting camera {c.name}")
+            c.start()
+            trace(f"camera {c.name} started")
+        # Settle: grab a couple of frames so the auto-exposure has converged
+        # and the pipelines are fully past their startup transients before
+        # we let the motor control thread come online.
+        for _ in range(3):
+            top.grab(); cam_l.grab(); cam_r.grab()
+        trace("cameras streaming, USB quiet -- safe to init arms")
+    except Exception:
+        # If camera setup failed, close anything we partially opened then
+        # re-raise. We have not started motor threads yet so arms aren't
+        # at risk.
+        for c in (top, cam_l, cam_r):
+            if c is not None:
+                try: c.stop()
+                except Exception: pass
+        raise
+
     trace("about to init LEFT arm")
     left = init_arm(args.left_can, args.left_gripper)
     trace("about to init RIGHT arm")
@@ -659,19 +693,6 @@ def main() -> None:
         log.info("--move-to-ready: ramping arms to training-mean pose (5s)...")
         ramp_to_pose(left, right, target, duration_s=args.ramp_duration_s,
                      label="move-to-ready")
-
-    # Cameras — each slot can be RealSense or V4L2 independently. Resolution
-    # applies to all three; the MolmoAct2 image processor tiles adaptively so
-    # any reasonable size works (training was at 256x342).
-    cam_kw = dict(width=args.cam_width, height=args.cam_height, fps=args.cam_fps)
-    trace(f"building cameras at {args.cam_width}x{args.cam_height}/{args.cam_fps}fps")
-    top   = make_camera("top",   args.top_cam_serial,   args.top_cam_v4l2,   **cam_kw)
-    cam_l = make_camera("left",  args.left_cam_serial,  args.left_cam_v4l2,  **cam_kw)
-    cam_r = make_camera("right", args.right_cam_serial, args.right_cam_v4l2, **cam_kw)
-    for c in (top, cam_l, cam_r):
-        trace(f"starting camera {c.name}")
-        c.start()
-        trace(f"camera {c.name} started")
 
     # Use Python's default SIGINT behavior (raises KeyboardInterrupt at the
     # next interpreter checkpoint) rather than a custom handler that sets a
