@@ -254,25 +254,45 @@ def main() -> None:
     # ----- RTC-specific ---------------------------------------------------
     p.add_argument(
         "--execution-horizon", type=int, default=DEFAULT_HORIZON_STRIDE,
-        help="How many actions from each chunk to execute before re-querying. "
-             "The remainder of each chunk (chunk_size - exec_horizon actions) "
-             "is sent back as prev_chunk_left_over so the next chunk's first "
-             "few actions are inpainted to continue smoothly. "
-             "Should match the server's --rtc-execution-horizon for cleanest "
-             "behavior; if you mismatch them, the server's RTC config wins "
-             "(and the client just executes whatever subset it wants).",
+        help="BOOTSTRAP value for execution_horizon, used only for the very "
+             "first /act call (before we have an RTT measurement). After "
+             "that, the client adapts execution_horizon to "
+             "ceil(EMA(RTT) / dt), clamped to [--rtc-min-horizon, "
+             "--rtc-max-horizon]. Per the RTC paper's canonical regime, "
+             "execution_horizon and inference_delay are always equal in "
+             "this client -- both control the wall-clock alignment of the "
+             "leftover prefix.",
+    )
+    p.add_argument(
+        "--rtc-min-horizon", type=int, default=5,
+        help="Minimum value of the adaptive execution_horizon. Stops the "
+             "system from replanning too aggressively if RTT briefly dips "
+             "(< rtc_min_horizon * dt). Default 5 (~166 ms at 30 Hz).",
+    )
+    p.add_argument(
+        "--rtc-max-horizon", type=int, default=20,
+        help="Maximum value of the adaptive execution_horizon. Stops the "
+             "system from going too far open-loop if RTT spikes "
+             "(> rtc_max_horizon * dt). Default 20 (~666 ms at 30 Hz). "
+             "Must be < chunk_size (=30) so the leftover has positions "
+             "to inpaint over.",
     )
     p.add_argument(
         "--inference-delay-mode", default="ema-rtt",
         choices=["ema-rtt", "fixed", "zero"],
-        help="How to compute inference_delay (in timesteps) to send to the "
-             "server: ema-rtt = EMA(RTT)/dt rounded up (recommended); "
-             "fixed = always use --inference-delay-fixed; zero = always 0 "
-             "(degenerates to vanilla chunked inference, useful as ablation).",
+        help="How to drive the adaptive horizon. "
+             "ema-rtt (default): execution_horizon = inference_delay = "
+             "ceil(EMA(RTT)/dt), as the RTC paper assumes. "
+             "fixed: both quantities pinned to --inference-delay-fixed. "
+             "zero: inference_delay forced to 0 (DIAGNOSTIC ABLATION -- "
+             "disables prefix anchoring entirely, degenerates to vanilla "
+             "chunked inference; useful for separating RTC's contribution "
+             "from raw async-chunking).",
     )
     p.add_argument(
-        "--inference-delay-fixed", type=int, default=0,
-        help="If --inference-delay-mode=fixed, send this constant value.",
+        "--inference-delay-fixed", type=int, default=10,
+        help="If --inference-delay-mode=fixed, use this constant for both "
+             "execution_horizon and inference_delay.",
     )
     p.add_argument(
         "--inference-delay-ema-alpha", type=float, default=0.5,
@@ -324,17 +344,10 @@ def main() -> None:
                 health["rtc"].get("schedule"),
                 health["rtc"].get("max_guidance_weight"),
             )
-            # If the user asked for a different exec_horizon than the server is
-            # configured with, log a warning so it's not surprising in journals.
-            srv_eh = health["rtc"].get("execution_horizon")
-            if srv_eh is not None and int(srv_eh) != int(args.execution_horizon):
-                log.warning(
-                    "client --execution-horizon=%d != server's exec_horizon=%s. "
-                    "Client controls how many actions get executed per chunk; "
-                    "server controls how its RTC sampler treats the boundary. "
-                    "Mismatches are valid but worth noting.",
-                    args.execution_horizon, srv_eh,
-                )
+            # The server's reported execution_horizon is just the RTCConfig
+            # default; the client overrides it on every request with the
+            # adaptive value from _compute_horizon_and_delay(). So a mismatch
+            # at boot is expected and not a warning condition.
     except Exception as e:
         log.error("server health check failed at %s: %s", args.server_url, e)
         sys.exit(2)
@@ -411,26 +424,48 @@ def main() -> None:
     except Exception as e:
         log.error("server warmup failed: %s. Continuing anyway.", e)
 
-    # ---- Build inference-delay estimator ------------------------------------
-    # The lerobot RTC code expects an integer count of timesteps. We translate
-    # an RTT-in-ms estimate to that via dt (1/train_fps).
+    # ---- Adaptive horizon estimator -----------------------------------------
+    # The RTC paper assumes execution_horizon == inference_delay in steady
+    # state -- the new chunk is generated to start exactly where the
+    # currently-executing chunk would be after `inference_delay` timesteps,
+    # and we hand it off the moment the previous chunk reaches that point.
+    # That assumption is correct iff
+    #
+    #     execution_horizon * dt  ==  RTT  ==  inference_delay * dt
+    #
+    # If they disagree, the leftover slice (= current_chunk[execution_horizon:])
+    # refers to a wall-clock instant different from what chunk_N+1[0]
+    # corresponds to, and the prefix attention anchors to the wrong
+    # timestep. So we make both adapt to measured RTT:
+    #
+    #     execution_horizon = inference_delay = ceil(RTT_ema / dt)
+    #
+    # clamped to [rtc_min_horizon, rtc_max_horizon] so we never replan too
+    # often (causing thrash) or too rarely (long open-loop windows). Both
+    # ends are exposed as CLI flags below.
     rtt_ema_ms: Optional[float] = None
 
-    def _compute_inference_delay() -> int:
-        if args.inference_delay_mode == "zero":
-            return 0
+    def _compute_horizon_and_delay() -> tuple[int, int]:
+        """Return (execution_horizon, inference_delay), always equal in this
+        client. Falls back to args.execution_horizon (the bootstrap value)
+        until rtt_ema_ms has been initialized.
+        """
         if args.inference_delay_mode == "fixed":
-            return max(0, int(args.inference_delay_fixed))
-        # ema-rtt: ceil(EMA(RTT_ms) / dt_ms). Round up so we don't
-        # under-estimate (under-estimating means we tell the policy fewer
-        # timesteps have passed than actually did -> stale prefix).
+            h = max(1, int(args.inference_delay_fixed))
+            return h, h
+        if args.inference_delay_mode == "zero":
+            # Diagnostic ablation: degenerate to non-prefix behaviour.
+            # inference_delay=0 means no prefix anchoring; execution_horizon
+            # still controls how many actions we play per chunk.
+            return max(1, int(args.execution_horizon)), 0
+        # ema-rtt (default): both quantities track ceil(RTT / dt).
         if rtt_ema_ms is None:
-            return 0
+            h = max(1, int(args.execution_horizon))
+            return h, h
         dt_ms = inner_dt * 1000.0
-        delay = int(np.ceil(rtt_ema_ms / dt_ms))
-        # Clamp to a sane range: at most half the chunk (otherwise the policy
-        # has nothing to inpaint with).
-        return max(0, min(delay, 15))
+        h = int(np.ceil(rtt_ema_ms / dt_ms))
+        h = max(args.rtc_min_horizon, min(h, args.rtc_max_horizon))
+        return h, h
 
     # ---- RTC state machine --------------------------------------------------
     # We always run async (RTC's whole point is to overlap inference with
@@ -464,28 +499,32 @@ def main() -> None:
 
     try:
         while not stop_flag["stop"]:
-            stride = max(1, args.execution_horizon)
+            # Adaptive horizon: both quantities derived from measured RTT.
+            # execution_horizon controls BOTH where we slice the leftover
+            # AND how many actions we play before re-querying. Keeping them
+            # equal to inference_delay ensures wall-clock alignment.
+            exec_horizon, inference_delay = _compute_horizon_and_delay()
             chunk_len = current_chunk.shape[0]
-            n_to_play = min(stride, chunk_len)
+            n_to_play = min(exec_horizon, chunk_len)
 
             # ---- Prepare next-request inputs (NOW, before executing) ------
-            # We send the NEXT chunk's leftover prefix (=current_chunk[stride:])
-            # so the policy can inpaint a smooth handoff. We also need a fresh
-            # observation -- and the convention from RTC is to use the state
-            # at the moment of kick-off (not the state at chunk-end).
+            # We send the NEXT chunk's leftover prefix
+            # (= current_chunk[exec_horizon:]) so the policy can inpaint a
+            # smooth handoff. The state is sampled at the moment of kick-off
+            # (= the wall-clock instant chunk_N+1[0] represents in the
+            # canonical RTC regime).
             next_state = read_state(left, right)
             next_top = top.grab()
             next_left = cam_l.grab()
             next_right = cam_r.grab()
 
-            # The leftover is the unexecuted tail of the current chunk. RTC
-            # paper convention: shape (chunk_size - exec_horizon, action_dim).
-            # If the chunk is shorter than that we just pass what's there.
+            # Leftover = unexecuted tail of the current chunk. Shape:
+            # (chunk_size - exec_horizon, action_dim). RTC processor pads
+            # this back up to chunk_size with zeros internally.
             leftover = (
-                current_chunk[stride:].astype(np.float32, copy=True)
-                if chunk_len > stride else None
+                current_chunk[exec_horizon:].astype(np.float32, copy=True)
+                if chunk_len > exec_horizon else None
             )
-            inference_delay = _compute_inference_delay()
 
             # ---- Per-query diagnostics on the CURRENT chunk ---------------
             def _arm_delta_max(a_idx: int) -> float:
@@ -540,13 +579,13 @@ def main() -> None:
                     next_state, next_top, next_left, next_right,
                     prev_chunk_left_over=leftover,
                     inference_delay=inference_delay,
-                    execution_horizon=args.execution_horizon,
+                    execution_horizon=exec_horizon,
                 )
             except RuntimeError as e:
                 log.error("kick_off failed: %s", e)
                 break
 
-            # ---- Execute current_chunk[0 : stride] -----------------------
+            # ---- Execute current_chunk[0 : exec_horizon] -----------------
             clipped_this_query = 0
             steps_this_query = 0
             for i in range(n_to_play):
