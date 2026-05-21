@@ -396,20 +396,19 @@ def main() -> None:
 
             # One-shot frame-dump for visual debugging. Run with --dump-frames /tmp/foo
             # then inspect /tmp/foo/top.png / left.png / right.png to see exactly what
-            # the model is being shown.
+            # the model is being shown. NOTE: don't re-import os here; it's already at
+            # module level. A local `import os` inside this block would shadow it and
+            # break the finally's os._exit(0) call when dump-frames is NOT set.
             if args.dump_frames:
-                import os
                 import cv2
                 os.makedirs(args.dump_frames, exist_ok=True)
                 for name, img in [("top", top_img), ("left", left_img), ("right", right_img)]:
-                    # Frames are RGB uint8 from our streams; cv2.imwrite expects BGR.
                     bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                     out_path = os.path.join(args.dump_frames, f"{name}.png")
                     cv2.imwrite(out_path, bgr)
                     log.info("dumped %s (%dx%d) to %s", name, img.shape[1], img.shape[0], out_path)
                 log.info("dump-frames mode -- exiting before any inference.")
-                import sys as _sys
-                _sys.stdout.flush()
+                sys.stdout.flush()
                 os._exit(0)
 
             actions, rtt_ms = post_actions(
