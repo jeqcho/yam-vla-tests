@@ -35,6 +35,109 @@ from i2rt.robots.get_robot import get_yam_robot
 from i2rt.robots.robot import Robot
 from i2rt.robots.utils import ArmType, GripperType
 
+
+def install_sdk_lock_fix() -> None:
+    """Replace i2rt's dm_driver control loop with a version that doesn't hold
+    command_lock during CAN I/O.
+
+    The shipped loop (dm_driver.py:529) holds self.command_lock through the
+    full 7-motor CAN round-trip (~3 ms). The OTHER SDK thread,
+    motor_chain_robot._server_thread, also needs command_lock to push our
+    target positions, and Linux's mutex isn't fair under sustained contention
+    -- it gets starved for hundreds of ms. While starved, no new commands
+    reach the motors; the SDK keeps streaming the last target at 300 Hz; the
+    arm holds. Then the lock frees, the now-stale target gets pushed, the
+    motor PD jumps -> visible burst motion.
+
+    Patched loop holds command_lock only for a microsecond list-copy and does
+    CAN I/O on the local copy. Acquire p99 drops from ~400 ms to <0.1 ms,
+    set_commands throughput improves ~10x. Validated with test_sdk_lock_fix.py.
+
+    Call once at process startup, BEFORE any DMChainCanInterface is created.
+    """
+    import logging as _logging
+    import time as _t
+    from i2rt.motor_drivers import dm_driver as _dm
+    EXPECTED = _dm.EXPECTED_CONTROL_PERIOD
+
+    def _patched(self) -> None:
+        last_step_time = _t.time()
+        step_time_exceed_count = 0
+        step_time_sum = 0.0
+        step_time_count = 0
+        report_start_time = _t.time()
+        with self._rate_recorder:
+            while self.running:
+                try:
+                    curr_time = _t.time()
+                    step_time = curr_time - last_step_time
+                    last_step_time = curr_time
+                    step_time_sum += step_time
+                    step_time_count += 1
+                    if step_time > EXPECTED:
+                        step_time_exceed_count += 1
+                    if step_time_exceed_count > 0 and curr_time - report_start_time >= self._report_interval:
+                        mean_step_time = step_time_sum / step_time_count if step_time_count > 0 else 0.0
+                        _logging.info(
+                            f"[PATCHED {self} {self._report_interval}s Report] "
+                            f"step_time > {EXPECTED}s: {step_time_exceed_count} times, "
+                            f"mean step_time: {mean_step_time:.6f} s"
+                        )
+                        step_time_exceed_count = 0
+                        step_time_sum = 0.0
+                        step_time_count = 0
+                        report_start_time = curr_time
+
+                    # THE FIX: brief snapshot, then CAN outside the lock.
+                    with self.command_lock:
+                        local_commands = list(self.commands)
+                    try:
+                        motor_feedback = self._set_commands(local_commands)
+                    except RuntimeError as e:
+                        if "Motor error detected" in str(e):
+                            _logging.warning(f"Motor error in control loop, attempting recovery: {e}")
+                            recovered = self._try_recover_motors()
+                            if recovered:
+                                _logging.warning("Motor recovery successful, continuing control loop")
+                                continue
+                            else:
+                                self.running = False
+                                raise
+                        raise
+                    errors = np.array([motor_feedback[i].error_code != "0x1"
+                                       for i in range(len(motor_feedback))])
+                    if np.any(errors):
+                        _logging.warning(f"Motor errors detected in feedback: {errors}")
+                        recovered = self._try_recover_motors(motor_feedback)
+                        if recovered:
+                            _logging.warning("Motor recovery successful, continuing control loop")
+                            continue
+                        self.running = False
+                        _logging.error(f"motor errors: {errors}")
+                        raise Exception(
+                            "motors have unrecoverable errors after recovery attempts, stopping control loop"
+                        )
+                    with self.state_lock:
+                        self.state = motor_feedback
+                        self._update_absolute_positions(motor_feedback)
+                    if self.same_bus_device_driver is not None:
+                        _t.sleep(0.001)
+                        with self.same_bus_device_lock:
+                            self.same_bus_device_states = self.same_bus_device_driver.read_states()
+                    _t.sleep(0)
+                    self._rate_recorder.track()
+                except Exception as e:
+                    print(f"DM Error in PATCHED control loop: {e}")
+                    self.running = False
+                    raise e
+
+    _dm.DMChainCanInterface._set_torques_and_update_state = _patched
+
+
+# Apply the SDK lock fix immediately at import time so it lands before any
+# DMChainCanInterface is constructed. See install_sdk_lock_fix() docstring.
+install_sdk_lock_fix()
+
 json_numpy.patch()
 
 # Make stdout unbuffered so we can actually see where things hang.
