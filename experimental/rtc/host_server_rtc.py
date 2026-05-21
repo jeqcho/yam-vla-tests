@@ -244,7 +244,9 @@ class RTCPolicy:
         # Import inside the method so a stale import in the policy module
         # doesn't poison this hot path (also keeps the file importable even
         # if lerobot is missing — predict() will raise at call-time instead).
-        from lerobot.configs.types import TransitionKey
+        # On the molmoact2-policy branch TransitionKey lives at lerobot.types,
+        # not lerobot.configs.types where older versions kept it.
+        from lerobot.types import TransitionKey
 
         state_f32 = np.asarray(state, dtype=np.float32).reshape(-1)
         if state_f32.shape != (STATE_DIM,):
