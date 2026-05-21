@@ -214,6 +214,133 @@ def _rr_log_inference(t_s: float, actions, executed_idx: int, rtt_ms: float,
     _rr.log("action/right/gripper", _rr.Scalars(float(a[13])))
 
 
+# --- Research journal ----------------------------------------------------
+# At end of every run, prompt the user for a one-line status report and
+# append a structured markdown entry to journal.md. See prompt_journal_entry
+# and write_journal_entry below. Set --no-journal to skip, or override the
+# path with --journal-path.
+from datetime import datetime
+
+DEFAULT_JOURNAL_PATH = "/home/andon/yam-tests/molmoact2-setup/journal.md"
+
+
+def _journal_format_duration(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s"
+
+
+def _journal_invocation() -> str:
+    """Return the user's original shell invocation if run_client.sh exported
+    YAM_INVOCATION, else fall back to sys.argv (the python-level call).
+    """
+    inv = os.environ.get("YAM_INVOCATION")
+    if inv:
+        return inv
+    return " ".join(sys.argv)
+
+
+def _journal_format_args(args) -> str:
+    """Render argparse Namespace as a markdown bullet list. Skips defaults
+    that are None/False to keep entries readable.
+    """
+    lines = []
+    for k, v in sorted(vars(args).items()):
+        if v is None or v is False:
+            continue
+        # Truncate long strings (instruction can be huge).
+        sv = repr(v) if isinstance(v, str) and len(v) > 120 else str(v)
+        lines.append(f"- `{k}`: {sv}")
+    return "\n".join(lines) if lines else "_(none)_"
+
+
+def prompt_journal_entry(start_time_s: float, args) -> Optional[dict]:
+    """Interactively ask the user how the run went.
+
+    Returns a dict with status/notes/purpose/duration/timestamp, or None if
+    the user skipped (or stdin isn't a TTY -- so CI/piped runs are safe).
+    """
+    if not sys.stdin.isatty():
+        print("[journal] stdin is not a TTY, skipping journal prompt", flush=True)
+        return None
+    if getattr(args, "no_journal", False):
+        return None
+
+    duration_s = time.time() - start_time_s
+    print("\n" + "=" * 70, flush=True)
+    print("Research journal -- record this run?", flush=True)
+    print("=" * 70, flush=True)
+    print(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"Duration:    {_journal_format_duration(duration_s)}", flush=True)
+    print("", flush=True)
+    print("How did the run go?", flush=True)
+    print("  [s] success  -- task completed as intended", flush=True)
+    print("  [f] failure  -- task did not complete or had clear problems", flush=True)
+    print("  [u] unclear  -- partial / mixed / hard to say", flush=True)
+    print("  [enter or 'skip']  don't record this run", flush=True)
+    sys.stdout.flush()
+    try:
+        choice = input("> ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\n[journal] skipped", flush=True)
+        return None
+    if not choice or choice.startswith("skip"):
+        print("[journal] skipped", flush=True)
+        return None
+    status_map = {"s": "success", "f": "failure", "u": "unclear"}
+    status = status_map.get(choice[:1])
+    if status is None:
+        print(f"[journal] unrecognized status {choice!r}, skipping", flush=True)
+        return None
+
+    try:
+        notes = input("\nWhat happened? (one line, optional)\n> ").strip()
+        purpose = input("\nPurpose of this run? (optional, what were you testing)\n> ").strip()
+    except (KeyboardInterrupt, EOFError):
+        notes = locals().get("notes", "")
+        purpose = ""
+        print("\n[journal] partial entry recorded", flush=True)
+
+    return {
+        "status": status,
+        "notes": notes,
+        "purpose": purpose,
+        "duration_s": duration_s,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def write_journal_entry(path: str, entry: dict, args, invocation: str) -> None:
+    """Append a single markdown entry to the journal."""
+    md = []
+    md.append("")
+    md.append("---")
+    md.append(f"## {entry['timestamp']} -- {entry['status']}")
+    md.append("")
+    if entry.get("purpose"):
+        md.append(f"**Purpose**: {entry['purpose']}")
+        md.append("")
+    if entry.get("notes"):
+        md.append(f"**Notes**: {entry['notes']}")
+        md.append("")
+    md.append(f"**Duration**: {_journal_format_duration(entry['duration_s'])}")
+    md.append("")
+    md.append("**Command**:")
+    md.append("```")
+    md.append(invocation)
+    md.append("```")
+    md.append("")
+    md.append("**Configuration**:")
+    md.append(_journal_format_args(args))
+    md.append("")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n".join(md) + "\n")
+    print(f"[journal] wrote {entry['status']} entry to {path}", flush=True)
+
+
 # Default per-step caps (radians for joints, normalized for gripper).
 # 0.15 rad/step at 30 Hz = 4.5 rad/s (~260 deg/s) joint velocity ceiling -- well
 # above any speed the policy should naturally produce in-distribution, but still
@@ -496,6 +623,10 @@ def post_actions(
 
 
 def main() -> None:
+    # Capture wall-clock start of the run for the research journal duration.
+    journal_start_s = time.time()
+    journal_invocation = _journal_invocation()
+
     p = argparse.ArgumentParser(description="MolmoAct2-BimanualYAM client")
     p.add_argument("--left-can", default="can0", help="CAN channel for the LEFT arm")
     p.add_argument("--right-can", default="can1", help="CAN channel for the RIGHT arm")
@@ -570,6 +701,13 @@ def main() -> None:
                    help="Also save the rerun recording to a .rrd file. Even if the "
                         "live viewer lags, the file lets you replay the full session "
                         "later with `rerun PATH`. Implies --rerun.")
+    p.add_argument("--no-journal", action="store_true",
+                   help="Skip the end-of-run prompt that asks how the run went. "
+                        "Default behavior is to ask and append a markdown entry to "
+                        "the journal file.")
+    p.add_argument("--journal-path", default=DEFAULT_JOURNAL_PATH,
+                   help=f"Path to the research journal (markdown, appended). "
+                        f"Default: {DEFAULT_JOURNAL_PATH}")
     args = p.parse_args()
 
     # Loud-warn the user if they've disabled the per-step clip. Six months from
@@ -902,6 +1040,18 @@ def main() -> None:
         log.info("Arms returned to startup pose and motors disabled.")
         sys.stdout.flush()
         sys.stderr.flush()
+
+        # Research journal: prompt user for run notes and append to journal.md.
+        # Done AFTER motors are safely down so the user isn't pressed to answer
+        # while the arms might still be holding. Failures in the journal step
+        # must not prevent process exit -- wrap in broad except.
+        try:
+            entry = prompt_journal_entry(journal_start_s, args)
+            if entry is not None:
+                write_journal_entry(args.journal_path, entry, args, journal_invocation)
+        except Exception as e:
+            log.warning("journal step failed: %s", e)
+
         os._exit(0)
 
 

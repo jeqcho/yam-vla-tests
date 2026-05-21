@@ -13,6 +13,13 @@ if [[ ! -x "$PYTHON" ]]; then
     exit 1
 fi
 
+# Preserve the user's original shell invocation so yam_client.py can record
+# it in the research journal. Without this, the journal would show the
+# python-level argv ("scripts/yam_client.py --left-can ..."), which is
+# correct but harder to recognize. Use printf %q to keep quoting reproducible.
+INVOCATION_ARGS=$(printf ' %q' "$@")
+export YAM_INVOCATION="${BASH_SOURCE[0]}${INVOCATION_ARGS}"
+
 exec "$PYTHON" "$SETUP_DIR/scripts/yam_client.py" \
     --instruction "first pick up the left orange cube and put it in the box, then pick up the right orange cube and put it in the box" \
     "$@"
