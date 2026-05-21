@@ -1,0 +1,25 @@
+[project]
+name = "dreamzero-yam-setup"
+version = "0.1.0"
+description = "DreamZero (WAM) inference + fine-tuning launcher for bimanual YAM. Inference runs on Modal because the 14B WAM needs >=2 GPUs and the local host is a single RTX 5090."
+requires-python = ">=3.11,<3.12"
+
+# Local deps are deliberately minimal: this venv only needs to talk to a remote
+# DreamZero WebSocket server and drive the i2rt SDK + RealSense cameras for the
+# bimanual YAM. The 14B model itself is loaded on Modal, not here.
+dependencies = [
+    "modal>=0.66",
+    "msgpack",
+    "msgpack-numpy",
+    "websockets>=14",
+    "numpy>=1.26,<2.0",
+    "pillow",
+    "huggingface_hub[cli]",
+    "hf-transfer",
+    "requests",
+    "tyro",
+    "openpi-client==0.1.1",  # matches dreamzero/pyproject.toml pin so wire format stays compatible
+]
+
+[tool.uv]
+package = false
