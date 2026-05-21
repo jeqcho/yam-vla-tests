@@ -150,7 +150,12 @@ def main() -> int:
     p.add_argument("--cmd-hz", type=float, default=50.0)
     p.add_argument("--amplitude", type=float, default=0.3)
     p.add_argument("--freq", type=float, default=0.5)
-    p.add_argument("--bias-shoulder", type=float, default=1.0)
+    p.add_argument("--bias-shoulder", type=float, default=1.0,
+                   help="shoulder pitch bias (rad, joint index 1)")
+    p.add_argument("--bias-elbow", type=float, default=1.0,
+                   help="elbow bend bias (rad, joint index 2) -- keeps gripper above table")
+    p.add_argument("--bias-wrist-pitch", type=float, default=-0.5,
+                   help="wrist pitch bias (rad, joint index 3) -- keeps gripper level")
     args = p.parse_args()
 
     from i2rt.robots import motor_chain_robot as mcr
@@ -170,10 +175,16 @@ def main() -> int:
     time.sleep(0.5)
     startup = np.asarray(robot.get_joint_pos(), dtype=np.float32)
 
-    # Ramp to test pose.
+    # Ramp to test pose. Bend shoulder/elbow/wrist so the gripper stays
+    # above the table when we sweep shoulder. Without elbow + wrist bends
+    # the wrist drops below the workspace surface.
     test_pose = startup.copy()
-    test_pose[1] = args.bias_shoulder
-    print("Ramping to test pose...", flush=True)
+    test_pose[1] = args.bias_shoulder       # shoulder pitch (forward)
+    test_pose[2] = args.bias_elbow          # elbow bend (forearm up)
+    test_pose[3] = args.bias_wrist_pitch    # wrist pitch (keep ee level)
+    print(f"Ramping to test pose: shoulder={args.bias_shoulder:.2f} "
+          f"elbow={args.bias_elbow:.2f} wrist_pitch={args.bias_wrist_pitch:.2f}",
+          flush=True)
     n_ramp = 120
     for i in range(1, n_ramp + 1):
         alpha = i / n_ramp
