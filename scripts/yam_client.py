@@ -215,9 +215,13 @@ def _rr_log_inference(t_s: float, actions, executed_idx: int, rtt_ms: float,
 
 
 # Default per-step caps (radians for joints, normalized for gripper).
-# Tuned conservatively — increase only after the policy looks safe.
-DEFAULT_MAX_STEP_RAD = 0.05
-DEFAULT_GRIPPER_STEP = 0.05
+# 0.15 rad/step at 30 Hz = 4.5 rad/s (~260 deg/s) joint velocity ceiling -- well
+# above any speed the policy should naturally produce in-distribution, but still
+# bounded enough that a single bad action chunk can't slam an arm. Pass
+# --max-step-rad 0 to disable the clip entirely (raw model output, no safety
+# net beyond i2rt's own 400 ms motor timeout).
+DEFAULT_MAX_STEP_RAD = 0.15
+DEFAULT_GRIPPER_STEP = 0.15
 DEFAULT_TRAIN_FPS = 30.0   # the policy's training cadence — controls inner-loop pace
 DEFAULT_HORIZON_STRIDE = 6 # play this many steps from each (30, 14) horizon before re-querying
 STATE_DIM = 14   # per-arm 7-D × 2
@@ -424,22 +428,35 @@ def safe_command(
     desired_action: np.ndarray,
     max_step_rad: float,
     gripper_step: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, int]:
     """Clip the desired action so each joint moves at most max_step_rad from
-    the current state in this tick. Returns the actually applied command.
+    the current state in this tick.
+
+    max_step_rad <= 0 disables the joint clip (gripper clip is also disabled
+    iff gripper_step <= 0 by the same mechanism, so passing 0 to both yields
+    pass-through behavior -- the policy's raw output goes straight to the
+    motors). i2rt's own 400 ms motor timeout is the only remaining safety.
+
+    Returns (cmd_actually_sent, n_clipped_dims) so callers can tally how
+    often the cap fires per query.
     """
     if desired_action.shape != (STATE_DIM,):
         raise ValueError(f"action shape {desired_action.shape} != ({STATE_DIM},)")
     delta = desired_action - current_state
     # Per-arm caps: indices 0..5 + 7..12 are arm joints, 6 + 13 are grippers.
-    caps = np.full(STATE_DIM, max_step_rad, dtype=np.float32)
-    caps[6] = gripper_step
-    caps[13] = gripper_step
+    # A non-positive cap means "no cap on that dimension" -- use +inf so the
+    # clip is a no-op there.
+    caps = np.full(STATE_DIM,
+                   max_step_rad if max_step_rad > 0 else np.inf,
+                   dtype=np.float32)
+    caps[6]  = gripper_step if gripper_step > 0 else np.inf
+    caps[13] = gripper_step if gripper_step > 0 else np.inf
     clipped_delta = np.clip(delta, -caps, caps)
+    n_clipped = int(np.sum(clipped_delta != delta))
     cmd = (current_state + clipped_delta).astype(np.float32)
     left.command_joint_pos(cmd[:ARM_DOFS])
     right.command_joint_pos(cmd[ARM_DOFS:])
-    return cmd
+    return cmd, n_clipped
 
 
 def post_actions(
@@ -511,9 +528,11 @@ def main() -> None:
     p.add_argument("--num-steps", type=int, default=10,
                    help="Flow-matching steps (server-side)")
     p.add_argument("--max-step-rad", type=float, default=DEFAULT_MAX_STEP_RAD,
-                   help="Per-joint per-tick clip (rad)")
+                   help="Per-arm-joint per-tick clip (rad). At 30 Hz, 0.15 caps "
+                        "joint velocity at ~4.5 rad/s. Pass 0 to disable the clip "
+                        "entirely (raw policy output goes to motors).")
     p.add_argument("--gripper-step", type=float, default=DEFAULT_GRIPPER_STEP,
-                   help="Gripper per-tick clip (normalized units)")
+                   help="Gripper per-tick clip (normalized units). Pass 0 to disable.")
     p.add_argument("--dump-frames",  default=None,
                    help="If set, save the first {top,left,right} frame the client sends to "
                         "the server into this directory as PNGs, then exit. Useful for "
@@ -548,6 +567,22 @@ def main() -> None:
                    help="Connect to an existing rerun viewer at HOST:PORT instead of "
                         "spawning one. Example: 127.0.0.1:9876")
     args = p.parse_args()
+
+    # Loud-warn the user if they've disabled the per-step clip. Six months from
+    # now we want this to be impossible to miss in the scrollback.
+    if args.max_step_rad <= 0 and args.gripper_step <= 0:
+        log.warning("=" * 70)
+        log.warning("--max-step-rad=0 AND --gripper-step=0: PER-STEP CLIPPING DISABLED")
+        log.warning("Arms will track raw policy output. The only remaining safety")
+        log.warning("is i2rt's 400 ms motor timeout. If the model produces a bad")
+        log.warning("action chunk, the arms WILL execute it.")
+        log.warning("=" * 70)
+    elif args.max_step_rad <= 0:
+        log.warning("--max-step-rad=0: arm-joint clipping disabled (grippers still clipped at %.3f)",
+                    args.gripper_step)
+    elif args.gripper_step <= 0:
+        log.warning("--gripper-step=0: gripper clipping disabled (arms still clipped at %.3f rad)",
+                    args.max_step_rad)
 
     # Initialize Rerun viewer if requested. Done before arms init so any setup
     # failures (missing display, port already in use) happen before motors turn on.
@@ -721,6 +756,11 @@ def main() -> None:
             _rr_log_inference(time.perf_counter() - loop_t0, actions,
                               executed_idx=0, rtt_ms=rtt_ms,
                               horizon_arm_span=horizon_arm_span)
+            # Count joints clipped across this stride. Useful for tuning
+            # --max-step-rad: if "clipped" is consistently >0 you're capping
+            # legitimate motion; if it stays 0, your cap is loose enough.
+            clipped_this_query = 0
+            steps_this_query = 0
             for i in range(n_to_play):
                 if stop_flag["stop"]:
                     break
@@ -731,8 +771,10 @@ def main() -> None:
                              np.array2string(desired, precision=3))
                 else:
                     state = read_state(left, right)
-                    safe_command(left, right, state, desired,
-                                 args.max_step_rad, args.gripper_step)
+                    _, n_clipped = safe_command(left, right, state, desired,
+                                                args.max_step_rad, args.gripper_step)
+                    clipped_this_query += n_clipped
+                    steps_this_query += 1
                 # Pace inner loop at the policy's training cadence.
                 sleep_left = inner_dt - (time.perf_counter() - step_start)
                 if sleep_left > 0:
@@ -744,6 +786,17 @@ def main() -> None:
                     # position targets just fine.
                     log.warning("inner step overrun by %.1f ms (target %.1f ms)",
                                 -sleep_left * 1000.0, inner_dt * 1000.0)
+            # Per-query clip telemetry: total clipped dims across this chunk.
+            # 14 dims × steps_this_query is the max possible. Logging here so
+            # it sits next to the /act diagnostics in the stdout stream.
+            if steps_this_query > 0 and (args.max_step_rad > 0 or args.gripper_step > 0):
+                max_possible = STATE_DIM * steps_this_query
+                pct = 100.0 * clipped_this_query / max_possible
+                if clipped_this_query > 0:
+                    log.info("clip: %d/%d dim-steps clipped (%.1f%%) "
+                             "[--max-step-rad=%.3f --gripper-step=%.3f]",
+                             clipped_this_query, max_possible, pct,
+                             args.max_step_rad, args.gripper_step)
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt -- shutting down")
     finally:
