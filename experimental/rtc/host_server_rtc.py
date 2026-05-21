@@ -235,7 +235,14 @@ class RTCPolicy:
         # concurrent calls (CUDA graph capture / action expert state).
         self._lock = threading.Lock()
 
-    @torch.inference_mode()
+    # NOTE: NO @torch.inference_mode() / @torch.no_grad() decorator.
+    # RTC's denoise_step calls torch.autograd.grad to compute a correction
+    # term during sampling (lerobot/policies/rtc/modeling_rtc.py:219). With
+    # inference_mode the activations have no grad_fn, so torch.autograd.grad
+    # raises "element 0 of tensors does not require grad and does not have
+    # a grad_fn". The model is in .eval() mode either way so no
+    # batchnorm/dropout updates happen; we just give up the inference_mode
+    # speedup. The flow-matching loop itself is the bulk of the compute.
     def predict(
         self,
         top_cam: np.ndarray,
