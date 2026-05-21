@@ -72,6 +72,62 @@ DEFAULT_HORIZON_STRIDE = 6 # play this many steps from each (30, 14) horizon bef
 STATE_DIM = 14   # per-arm 7-D × 2
 ARM_DOFS = 7     # 6 arm joints + 1 gripper
 
+# Path to the model's norm_stats.json. action_stats.mean is the centroid of
+# the training distribution -- a good "ready" pose to start inference from.
+NORM_STATS_PATH = (
+    "/home/andon/yam-tests/molmoact2-setup/hf-cache/hub/"
+    "models--allenai--MolmoAct2-BimanualYAM/snapshots/"
+    "28e56c0fa4cb8598bfc2261e45499b3cc77763d4/norm_stats.json"
+)
+NORM_TAG = "yam_dual_molmoact2"
+
+
+def load_training_mean_pose() -> np.ndarray:
+    """Return the 14-D centroid of the training action distribution."""
+    import json as _json
+    with open(NORM_STATS_PATH) as f:
+        d = _json.load(f)
+    mean = d["metadata_by_tag"][NORM_TAG]["action_stats"]["mean"]
+    return np.asarray(mean, dtype=np.float32)
+
+
+def ramp_to_pose(
+    left, right, target_14d: np.ndarray,
+    duration_s: float = 5.0, hz: float = 30.0,
+    abort_flag: dict | None = None,
+    label: str = "ramp",
+) -> None:
+    """Linearly interpolate both arms from their current pose to target_14d.
+    abort_flag['abort'] = True causes the loop to stop at the next step (the arms
+    are left at the last commanded interpolation point -- they will NOT fall as
+    long as the SDK control threads are still running and commanding that pose).
+    """
+    q_l = np.asarray(left.get_joint_pos(),  dtype=np.float32)
+    q_r = np.asarray(right.get_joint_pos(), dtype=np.float32)
+    start = np.concatenate([q_l, q_r])
+    goal = np.asarray(target_14d, dtype=np.float32).copy()
+    delta = goal - start
+    max_d = float(np.max(np.abs(delta)))
+    log.info("[%s] start=%s", label, np.array2string(start, precision=3))
+    log.info("[%s] goal =%s", label, np.array2string(goal, precision=3))
+    log.info("[%s] max per-joint delta = %.3f rad (%.1f deg), %.1fs ramp",
+             label, max_d, np.degrees(max_d), duration_s)
+    n_steps = max(1, int(duration_s * hz))
+    dt = 1.0 / hz
+    for i in range(1, n_steps + 1):
+        if abort_flag is not None and abort_flag.get("abort"):
+            log.warning("[%s] aborted at step %d/%d -- arms held at intermediate pose",
+                        label, i, n_steps)
+            return
+        alpha = i / n_steps
+        cmd = start + alpha * delta
+        left.command_joint_pos(cmd[:7].astype(np.float32))
+        right.command_joint_pos(cmd[7:].astype(np.float32))
+        time.sleep(dt)
+    # Hold briefly so PD settles.
+    time.sleep(0.5)
+    log.info("[%s] done", label)
+
 
 class CameraStream:
     """Base camera interface — start, grab one HxWx3 uint8 RGB frame, stop."""
@@ -311,6 +367,16 @@ def main() -> None:
                    help="If set, save the first {top,left,right} frame the client sends to "
                         "the server into this directory as PNGs, then exit. Useful for "
                         "visually verifying the model is seeing what we think it is.")
+    p.add_argument("--move-to-ready", action="store_true",
+                   help="Before inference, linearly ramp both arms from their startup pose "
+                        "to the MolmoAct2 training-distribution centroid (~shoulder 79°, elbow 70°). "
+                        "Without this the model often hedges flat near-identity actions.")
+    p.add_argument("--ramp-duration-s", type=float, default=5.0,
+                   help="seconds for move-to-ready (and return-to-start on exit) ramps")
+    p.add_argument("--no-return-on-exit", action="store_true",
+                   help="DANGEROUS: skip the return-to-startup-pose ramp at exit. "
+                        "If your startup pose was upright/stowed, you NEED the return ramp -- "
+                        "without it the arms drop when the SDK disables motors on close().")
     p.add_argument("--horizon-stride", type=int, default=DEFAULT_HORIZON_STRIDE,
                    help="Apply this many steps from each returned horizon before re-querying. "
                         "With train_fps=30 and stride=6, server is queried 5 Hz.")
@@ -343,6 +409,27 @@ def main() -> None:
     trace("about to init RIGHT arm")
     right = init_arm(args.right_can, args.right_gripper)
     trace("both arms initialized")
+
+    # SAFETY: capture the user's startup pose RIGHT NOW. The DM motors need
+    # continuous position commands to stay up; close() zeroes torques and the
+    # arms drop. Before exit we will ramp the arms back to this startup pose,
+    # whatever they chose it to be (presumably a stable rest pose).
+    startup_pose = np.concatenate([
+        np.asarray(left.get_joint_pos(),  dtype=np.float32),
+        np.asarray(right.get_joint_pos(), dtype=np.float32),
+    ])
+    log.info("Captured startup pose for return-on-exit: %s",
+             np.array2string(startup_pose, precision=3))
+
+    # Optional: move arms to MolmoAct2 training-mean pose so the model has
+    # in-distribution proprioception to ground on. Keeps grippers at startup.
+    if args.move_to_ready:
+        target = load_training_mean_pose()
+        target[6]  = startup_pose[6]
+        target[13] = startup_pose[13]
+        log.info("--move-to-ready: ramping arms to training-mean pose (5s)...")
+        ramp_to_pose(left, right, target, duration_s=args.ramp_duration_s,
+                     label="move-to-ready")
 
     # Cameras — each slot can be RealSense or V4L2 independently. Resolution
     # applies to all three; the MolmoAct2 image processor tiles adaptively so
@@ -470,14 +557,52 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt -- shutting down")
     finally:
-        # During cleanup, a second Ctrl-C should hard-kill immediately rather
-        # than escape from cv2.cap.release() or any other blocking call.
-        def _hard_exit(_sig, _frame):
-            os._exit(130)  # 128 + SIGINT
+        # SAFETY: Before disabling motors we ramp arms back to startup_pose
+        # so they end up where the user knows they can be safely de-powered.
+        # close() zeros torques -> arms fall under gravity -> ARMS DROP.
+        # The ONLY way to exit safely is to first reach a pose where the
+        # arms naturally rest. We ramp back to whatever pose they were in
+        # when the script started -- the user picked that pose; it's safe.
+        #
+        # Ctrl-C handling during cleanup:
+        #   - 1st Ctrl-C: abort the return ramp, arms drop, traceback warns.
+        #   - 2nd Ctrl-C: hard-exit immediately.
+        # Single dict shared between SIGINT handler and ramp_to_pose. The ramp
+        # checks abort["abort"] each step -- mutations through this reference
+        # propagate live.
+        abort = {"abort": False, "ctrlc_count": 0}
+        def _cleanup_sigint(_sig, _frame):
+            abort["ctrlc_count"] += 1
+            if abort["ctrlc_count"] == 1:
+                log.warning("Ctrl-C in cleanup: aborting return-ramp. ARMS WILL DROP. "
+                            "Ctrl-C again to hard-exit.")
+                abort["abort"] = True
+            else:
+                os._exit(130)
         try:
-            signal.signal(signal.SIGINT, _hard_exit)
+            signal.signal(signal.SIGINT, _cleanup_sigint)
         except Exception:
             pass
+
+        # Return the arms to startup_pose BEFORE closing them. This is the
+        # critical safety step. While this is running the SDK control threads
+        # are still alive commanding position, so the arms hold.
+        if left is not None and right is not None and 'startup_pose' in locals() \
+                and not args.no_return_on_exit:
+            try:
+                log.info("Returning arms to startup pose (%.1fs ramp) before disable...",
+                         args.ramp_duration_s)
+                ramp_to_pose(left, right, startup_pose,
+                             duration_s=args.ramp_duration_s,
+                             abort_flag=abort,
+                             label="return-on-exit")
+                if abort["abort"]:
+                    log.warning("return ramp was aborted -- arms may be mid-trajectory")
+            except BaseException as e:
+                log.warning("return-to-startup ramp failed: %s. ARMS MAY DROP.", e)
+        elif args.no_return_on_exit:
+            log.warning("--no-return-on-exit set: skipping return ramp. ARMS WILL DROP "
+                        "if they are not in a pose that rests stably.")
 
         log.info("Stopping cameras")
         for c in (top, cam_l, cam_r):
@@ -485,10 +610,11 @@ def main() -> None:
                 c.stop()
             except BaseException as e:
                 log.warning("camera %s stop failed: %s", c.name, e)
-        # Stop the i2rt SDK's per-arm background control threads. Without
-        # this, the process won't exit even after main() returns -- the
-        # control threads are non-daemon and Python waits on them forever.
-        log.info("Closing arm SDKs")
+
+        # NOW close the arm SDKs. close() zeros torque + closes CAN socket.
+        # Arms will lose holding torque after this. They MUST be in a pose
+        # where that's acceptable -- ramp above should have put them there.
+        log.info("Closing arm SDKs (motors will lose holding torque now)")
         for arm in (left, right):
             if arm is None:
                 continue
@@ -496,9 +622,7 @@ def main() -> None:
                 arm.close()
             except BaseException as e:
                 log.warning("arm.close() failed: %s", e)
-        log.info("Arms left in their last commanded position -- kill power if not safe.")
-        # Force-exit: any thread that didn't honor close() (e.g. waiting on a
-        # CAN read in a C extension) won't keep the process alive.
+        log.info("Arms returned to startup pose and motors disabled.")
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
