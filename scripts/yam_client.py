@@ -166,6 +166,54 @@ def trace(msg: str) -> None:
     print(f"[TRACE] {msg}", flush=True)
 
 
+# --- Optional Rerun observability ----------------------------------------
+# Holds the rerun module when --rerun is enabled, else None. Lazy-imported in
+# main() so the import cost (~half a second) is only paid when requested.
+_rr = None
+
+
+def _rr_log_observation(t_s: float, top_img, left_img, right_img, state) -> None:
+    """Log one observation (3 camera frames + 14-dim joint state) to Rerun.
+
+    No-op if --rerun wasn't passed. Uses a monotonic 'time' timeline (seconds
+    since process start) so the viewer scrubs cleanly. Joint state is split
+    into left/right arm groups with one scalar entity per joint -- the viewer
+    auto-stacks them into a plot.
+    """
+    if _rr is None:
+        return
+    _rr.set_time("time", duration=t_s)
+    _rr.log("cam/top",   _rr.Image(top_img))
+    _rr.log("cam/left",  _rr.Image(left_img))
+    _rr.log("cam/right", _rr.Image(right_img))
+    for i in range(6):
+        _rr.log(f"state/left/j{i}",  _rr.Scalars(float(state[i])))
+        _rr.log(f"state/right/j{i}", _rr.Scalars(float(state[i + 7])))
+    _rr.log("state/left/gripper",  _rr.Scalars(float(state[6])))
+    _rr.log("state/right/gripper", _rr.Scalars(float(state[13])))
+
+
+def _rr_log_inference(t_s: float, actions, executed_idx: int, rtt_ms: float,
+                      horizon_arm_span: float) -> None:
+    """Log per-query inference outputs: rtt, horizon span, executed action.
+
+    `executed_idx` is the index within `actions` we're about to send to the
+    arms; we plot its 14 joint values so you can see action vs state on the
+    same timeline.
+    """
+    if _rr is None:
+        return
+    _rr.set_time("time", duration=t_s)
+    _rr.log("metrics/rtt_ms",           _rr.Scalars(float(rtt_ms)))
+    _rr.log("metrics/horizon_arm_span", _rr.Scalars(float(horizon_arm_span)))
+    a = actions[executed_idx]
+    for i in range(6):
+        _rr.log(f"action/left/j{i}",  _rr.Scalars(float(a[i])))
+        _rr.log(f"action/right/j{i}", _rr.Scalars(float(a[i + 7])))
+    _rr.log("action/left/gripper",  _rr.Scalars(float(a[6])))
+    _rr.log("action/right/gripper", _rr.Scalars(float(a[13])))
+
+
 # Default per-step caps (radians for joints, normalized for gripper).
 # Tuned conservatively — increase only after the policy looks safe.
 DEFAULT_MAX_STEP_RAD = 0.05
@@ -492,7 +540,37 @@ def main() -> None:
                    help="HTTP timeout for the one-shot warmup call. Bump if the server is loading.")
     p.add_argument("--dry-run", action="store_true",
                    help="Don't command the arms; print actions only")
+    p.add_argument("--rerun", action="store_true",
+                   help="Stream observations (3 cam frames + 14-dim joint state) and "
+                        "per-query actions/RTT to a Rerun viewer. By default spawns "
+                        "the viewer locally; use --rerun-connect to point at a remote.")
+    p.add_argument("--rerun-connect", default=None, metavar="HOST:PORT",
+                   help="Connect to an existing rerun viewer at HOST:PORT instead of "
+                        "spawning one. Example: 127.0.0.1:9876")
     args = p.parse_args()
+
+    # Initialize Rerun viewer if requested. Done before arms init so any setup
+    # failures (missing display, port already in use) happen before motors turn on.
+    if args.rerun:
+        try:
+            import rerun as rr
+            global _rr
+            _rr = rr
+            rr.init("yam_inference", spawn=(args.rerun_connect is None))
+            if args.rerun_connect:
+                host, _, port = args.rerun_connect.partition(":")
+                rr.connect_grpc(f"rerun+http://{host}:{port}/proxy")
+                log.info("Rerun: connected to viewer at %s", args.rerun_connect)
+            else:
+                log.info("Rerun: spawned local viewer")
+        except ImportError:
+            log.error("--rerun requested but rerun-sdk not installed in this venv. "
+                      "Install with: VIRTUAL_ENV=/home/andon/yam-tests/i2rt/.venv "
+                      "uv pip install rerun-sdk")
+            sys.exit(2)
+        except Exception as e:
+            log.error("Rerun init failed: %s. Continuing without it.", e)
+            _rr = None
 
     # Health-check the server first so we fail fast.
     health_url = args.server_url.rstrip("/").rsplit("/", 1)[0] + "/act" if args.server_url.endswith("/act") else args.server_url
@@ -577,12 +655,18 @@ def main() -> None:
     except Exception as e:
         log.error("Server warmup failed: %s. Continuing anyway.", e)
 
+    # Wall-clock origin for the rerun timeline. We use a monotonic clock so
+    # the viewer's time axis is stable even if the system clock jumps.
+    loop_t0 = time.perf_counter()
+
     try:
         while not stop_flag["stop"]:
             state = read_state(left, right)
             top_img = top.grab()
             left_img = cam_l.grab()
             right_img = cam_r.grab()
+            _rr_log_observation(time.perf_counter() - loop_t0,
+                                top_img, left_img, right_img, state)
 
             # One-shot frame-dump for visual debugging. Run with --dump-frames /tmp/foo
             # then inspect /tmp/foo/top.png / left.png / right.png to see exactly what
@@ -634,6 +718,9 @@ def main() -> None:
 
             stride = max(1, args.horizon_stride)
             n_to_play = min(stride, actions.shape[0])
+            _rr_log_inference(time.perf_counter() - loop_t0, actions,
+                              executed_idx=0, rtt_ms=rtt_ms,
+                              horizon_arm_span=horizon_arm_span)
             for i in range(n_to_play):
                 if stop_flag["stop"]:
                     break
