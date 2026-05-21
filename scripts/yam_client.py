@@ -596,25 +596,18 @@ def main() -> None:
             import rerun as rr
             global _rr
             _rr = rr
-            rr.init("yam_inference")
-            # Spawn the matching-version viewer from the venv. Without this,
-            # rr.spawn() runs whatever `rerun` is first on PATH -- often a
-            # mismatched system-wide install (e.g. miniforge's 0.26.x while
-            # the SDK is 0.32.x). A version skew between viewer and SDK makes
-            # the viewer drop / mis-render messages, which looks like 'rerun
-            # is laggy' from the user's side.
-            if args.rerun_connect is None:
-                venv_rerun = "/home/andon/yam-tests/i2rt/.venv/bin/rerun"
-                spawn_kwargs = {}
-                if os.path.isfile(venv_rerun):
-                    spawn_kwargs["executable_name"] = venv_rerun
-                rr.spawn(**spawn_kwargs)
-                log.info("Rerun: spawned viewer (%s)",
-                         spawn_kwargs.get("executable_name", "from PATH"))
-            else:
+            # Spawn whatever rerun is first on PATH. The user has reported
+            # that the older system-wide viewer (e.g. 0.26.x) renders video
+            # playback better than the SDK-matching venv viewer (0.32.x) on
+            # this machine, so we don't force the venv binary. A version
+            # skew may trigger a warning at startup -- that's expected.
+            rr.init("yam_inference", spawn=(args.rerun_connect is None))
+            if args.rerun_connect:
                 host, _, port = args.rerun_connect.partition(":")
                 rr.connect_grpc(f"rerun+http://{host}:{port}/proxy")
                 log.info("Rerun: connected to viewer at %s", args.rerun_connect)
+            else:
+                log.info("Rerun: spawned local viewer")
             if args.rerun_save:
                 rr.save(args.rerun_save)
                 log.info("Rerun: also saving recording to %s", args.rerun_save)
