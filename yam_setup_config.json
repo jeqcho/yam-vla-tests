@@ -1,8 +1,9 @@
 {
-  "left_can": "can0",
-  "right_can": "can1",
+  "left_can": "can1",
+  "right_can": "can0",
   "gripper": "linear_4310",
-  "top_cam_v4l2": "/dev/video12",
+  "top_cam_v4l2": null,
   "left_cam_serial": "427622271914",
-  "right_cam_serial": "352122272708"
+  "right_cam_serial": "352122272708",
+  "top_cam_serial": "349622072241"
 }

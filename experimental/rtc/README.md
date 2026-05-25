@@ -75,7 +75,9 @@ Open a fresh terminal:
 ```
 
 This launches `host_server_rtc.py` with `bfloat16`, RTC enabled,
-`execution_horizon=10`, `max_guidance_weight=10.0`, LINEAR schedule. The
+`execution_horizon=10` (boot-time default; the client overrides per request),
+`max_guidance_weight=10.0` (β; matches lerobot's RTCConfig default — the
+paper does not pin β to a specific value), EXP schedule (paper Eq. 5). The
 server runs a two-pass warmup (with and without leftover) so both code
 paths capture CUDA graphs before the first real `/act`. First load is
 ~30 s; warmup adds another ~10–20 s.
@@ -95,40 +97,49 @@ In another terminal:
 
 ```bash
 ./experimental/rtc/run_client_rtc.sh \
-    --top-cam-v4l2 /dev/v4l/by-id/usb-SONix_Technology_Co.__Ltd._Streaming_Camera_SN0001-video-index0 \
+    --top-cam-serial 349622072241 \
     --left-cam-serial 427622271914 \
     --right-cam-serial 352122272708 \
     --move-to-ready \
-    --execution-horizon 10 \
+    --execution-horizon 8 \
     --max-step-rad 0.05
 ```
 
+(Top camera changed from a SONix V4L2 USB cam to a RealSense D435 — hence
+`--top-cam-serial` instead of `--top-cam-v4l2`. Left/right D405 wrist cams
+unchanged.)
+
 Same CLI surface as `scripts/run_client.sh` plus the RTC-specific knobs:
 
-**Horizon and delay control** (these are now adaptive by default):
+**Horizon and delay control** (decoupled, paper-faithful):
 
-- `--execution-horizon` (default 10): BOOTSTRAP value for `execution_horizon`,
-  used only for the very first /act call before any RTT measurement.
-  After that the client adapts `execution_horizon = inference_delay =
-  ceil(EMA(RTT) / dt)`, clamped to `[--rtc-min-horizon, --rtc-max-horizon]`.
-  Per the RTC paper's canonical regime, both quantities are kept equal in
-  steady state so the leftover prefix slice is always wall-clock-aligned.
-- `--rtc-min-horizon` (default 5): lower bound on the adaptive horizon.
-- `--rtc-max-horizon` (default 20): upper bound on the adaptive horizon.
-- `--inference-delay-mode` (default `ema-rtt`): `ema-rtt` adapts as
-  described above; `fixed` pins both quantities to `--inference-delay-fixed`;
-  `zero` forces inference_delay=0 (diagnostic ablation that disables
-  prefix anchoring).
-- `--inference-delay-ema-alpha` (default 0.5): EMA smoothing factor.
+- `--execution-horizon` (default 8): paper's `s` — the number of actions
+  played between consecutive inference calls. Fixed for the whole rollout.
+  The paper hints `s ≈ H/2` but `H/4` (=8) leaves more room for `d` to
+  spike without underflowing the queue. Paper's constraint is
+  `d ≤ s ≤ H - d`; with `H=30`, set `s ≤ 14` to keep room for `d`.
+- `--rtc-rtt-buffer-size` (default 8): size of the buffer used to
+  predict `inference_delay = ceil(max(buffer) / dt)` per paper Alg. 1
+  line 18 (`d = max(Q)`). Max-of-buffer (NOT EMA) is the paper's choice
+  because it is conservative under spikes.
+- `--rtc-inference-delay-fixed INT`: pin `inference_delay` to a constant
+  (ticks) instead of estimating from RTT. Useful for ablation.
+- `--rtc-zero-delay`: diagnostic ablation that forces `inference_delay = 0`
+  (empty frozen prefix in the mask).
+- `--rtc-min-inference-delay` (default 1) and `--rtc-max-inference-delay`
+  (default auto = `(H - s) // 2`): clamps on the predicted `d`.
 
 **RTC sampler tuning** (per-request overrides, no server restart needed):
 
 - `--rtc-max-guidance-weight FLOAT`: override `RTCConfig.max_guidance_weight`
-  for every request this session. Higher = tighter prefix anchoring; lower
-  = more model freedom near chunk boundaries. Default (server-side) is 10.0
-  per the Pi-0 paper.
+  (β) for every request this session. The RTC paper does not pin β to a
+  specific value; the server default 10.0 matches lerobot's
+  `RTCConfig.max_guidance_weight`. Higher = tighter prefix anchoring;
+  lower = more model freedom near chunk boundaries.
 - `--rtc-schedule {linear,exp,zeros,ones}`: override
-  `prefix_attention_schedule`. `linear` is the paper default.
+  `prefix_attention_schedule`. `exp` is the paper's Eq. 5 default;
+  `linear` is lerobot's RTCConfig default (simpler, slightly different
+  fade curve).
 - `--rtc-debug`: turn on `RTCConfig.debug=True` per request (records
   per-step intermediate state). Off by default for speed.
 - `--seed INT`: seed the flow-matching noise initialization for
@@ -177,16 +188,25 @@ accepts three optional fields:
 ```python
 {
     ...
-    "prev_chunk_left_over": ndarray(L, 14) float32,  # optional
+    "prev_chunk_left_over": ndarray(L, 14) float32,  # optional, NORMALIZED
     "inference_delay":      int,                     # optional, default 0
     "execution_horizon":    int,                     # optional, default 10
 }
 ```
 
-Response: same shape (`actions` + `dt_ms`), with one extra dict
-`"rtc": {...}` that echoes the leftover length the server saw, exec
-horizon, inference_delay, and num_steps used. The non-RTC client will
-ignore that field; the RTC client uses it for sanity logging.
+`prev_chunk_left_over` MUST be in the model's NORMALIZED latent space
+(same scale as `actions_raw` returned by the server), not the
+de-normalized joint space the robot executes. The RTC inpainting mixes
+the leftover into the flow-matching trajectory before any
+de-normalization, so the round-trip has to be in raw space.
+
+Response: `actions` (de-normalized joint space, for execution),
+`actions_raw` (normalized latent space, to send back as leftover),
+`dt_ms`, and an `"rtc": {...}` dict that echoes leftover_len_in, exec
+horizon, inference_delay, num_steps, max_guidance_weight, schedule, and
+seed. The non-RTC client will ignore the extra fields; the RTC client
+uses `actions_raw` for the leftover round-trip and `rtc` for sanity
+logging.
 
 ## Bring-up notes (issues encountered and how they were fixed)
 
@@ -224,11 +244,21 @@ resolved. All fixes are committed in the current `host_server_rtc.py`.
    grad tracking and the autograd call raises. Removed the decorator;
    model is still in `.eval()`.
 
-8. **`inference_delay` clamping**: the client clamps the computed delay
-   to `[0, 15]` (half a chunk). If RTT is so high that this clamp fires
-   regularly, RTC's prefix-attention has effectively no leftover left to
-   inpaint and we degenerate to async-time-aligned behavior. The
-   `horizon_arm_span` log should help spot this.
+8. **`inference_delay` clamping**: the client clamps the predicted delay
+   to `[--rtc-min-inference-delay, --rtc-max-inference-delay]`, with the
+   upper bound defaulting to `(H - s) // 2` so paper's constraint
+   `d ≤ s ≤ H - d` is satisfied. If RTT is so high that the clamp fires
+   regularly, the queue starts underflowing and we degenerate to
+   near-sync behavior. The `underflow_ticks` counter in the periodic
+   `clip:` log line shows how often the queue ran dry.
+
+9. **Wire-API `execution_horizon` is NOT paper's `s`**: lerobot's
+   `predict_action_chunk(execution_horizon=…)` kwarg is the END of the
+   prefix-mask fade region, not the paper's execution horizon `s`. The
+   client sends `execution_horizon = len(leftover)` so the mask is
+   `ones(d), fade(d → len(leftover)), zeros(len(leftover) → H)` — which
+   matches the paper's Eq. 5 with `H - s` aligned to the actual leftover
+   boundary. Confusingly named in lerobot, but consistent in behavior.
 
 ## Reverting
 

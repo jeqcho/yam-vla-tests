@@ -53,6 +53,7 @@ from yam_client import (  # noqa: E402
     _journal_format_args,
     _journal_format_duration,
     init_arm,
+    load_saved_config,
     load_training_mean_pose,
     log,
     make_camera,
@@ -93,7 +94,8 @@ def write_attempt_entry(
     if notes:
         md.append(f"**Notes**: {notes}")
         md.append("")
-    md.append(f"**Duration**: {_journal_format_duration(stats['duration_s'])}")
+    md.append(f"**Duration**: {_journal_format_duration(stats['duration_s'])}"
+              + (" (timed out)" if stats.get("timed_out") else ""))
     md.append("")
     md.append("**Attempt stats**:")
     md.append(f"- chunks: {stats['n_chunks']}")
@@ -128,31 +130,67 @@ def write_attempt_entry(
 # ---------------------------------------------------------------------------
 
 class EnterStopWatcher:
-    """Spawn a daemon thread that blocks on input(); when the user hits enter
-    (or EOF), set stop_flag['stop'] = True. The main control loop polls the
-    flag each iteration.
+    """Spawn a daemon thread that polls stdin for an enter press; when seen,
+    sets stop_flag['stop'] = True so the main control loop exits at its next
+    check.
 
-    One watcher per attempt. After the attempt ends the thread has either
-    returned (user pressed enter) or is still blocked on input() and will die
-    with the process; we treat the watcher as single-use.
+    Polling (select with a short timeout) instead of blocking input() means
+    the watcher can be cancelled cleanly when the attempt ends for some
+    OTHER reason (auto-timeout, exception, etc.). Without cancel(), a
+    blocking watcher would still be waiting on stdin during the next prompt
+    and would steal the operator's next keystroke -- which is what caused
+    'f' to vanish at the outcome prompt and the attempt to log as 'skip'.
     """
 
     def __init__(self):
         self.stop_flag = {"stop": False}
+        self._cancelled = False
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
+        import select
         def _wait():
+            # Only poll a real TTY. If stdin is a pipe (CI/tests), bail.
             try:
-                input()  # blocks until enter (or EOF)
-            except (EOFError, KeyboardInterrupt):
-                pass
-            self.stop_flag["stop"] = True
-            print("[stop] enter received, stopping after current chunk...",
-                  flush=True)
+                if not sys.stdin.isatty():
+                    return
+            except Exception:
+                return
+            while not self._cancelled:
+                try:
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.2)
+                except (OSError, ValueError):
+                    return
+                if self._cancelled:
+                    return
+                if not rlist:
+                    continue
+                try:
+                    line = sys.stdin.readline()
+                except Exception:
+                    return
+                if self._cancelled:
+                    return
+                self.stop_flag["stop"] = True
+                if not line:
+                    print("[stop] EOF on stdin -- stopping...", flush=True)
+                else:
+                    print("[stop] enter received, stopping after current chunk...",
+                          flush=True)
+                return
         self._thread = threading.Thread(target=_wait, daemon=True,
                                          name="enter-stop-watcher")
         self._thread.start()
+
+    def cancel(self) -> None:
+        """Tell the watcher to exit without consuming any further stdin.
+        Call this from the main thread whenever the attempt ends for a
+        reason other than the watcher firing (timeout, exception, etc.).
+        Idempotent and safe to call after the watcher has already returned.
+        """
+        self._cancelled = True
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +203,15 @@ def run_one_attempt(
     instruction: str,
     attempt_idx: int,
     loop_t0: float,
+    attempt_timeout_s: Optional[float] = None,
 ) -> dict:
     """Run the closed-loop control until the operator presses enter, then
     return a stats dict. Does NOT ramp the arms back (caller does that).
+
+    attempt_timeout_s: wall-clock cap; if set (and >0), the loop ends
+        automatically after that many seconds even without an enter press.
+        Checked at chunk boundaries, so granularity is ~stride/train_fps
+        (~0.3 s by default). Useful for unattended evals.
 
     Mirrors yam_client.main()'s inner loop (lines 946-1083) so behavior is
     identical to a one-shot run. The only differences:
@@ -192,7 +236,21 @@ def run_one_attempt(
 
     attempt_start_s = time.time()
 
-    while not watcher.stop_flag["stop"]:
+    # Wrap the inner loop in a broad except so any exception (camera grab,
+    # arm I/O, etc.) is logged with a traceback before the attempt returns.
+    # Without this, exceptions propagate up through main()'s try/finally
+    # and the teardown's os._exit(0) eats the traceback -- the user sees
+    # "running" then immediate ramp-back with no error message.
+    has_timeout = attempt_timeout_s is not None and attempt_timeout_s > 0
+    timed_out = False
+
+    try:
+      while not watcher.stop_flag["stop"]:
+        if has_timeout and (time.time() - attempt_start_s) > attempt_timeout_s:
+            log.info("attempt timeout (%.0fs) reached -- stopping",
+                     attempt_timeout_s)
+            timed_out = True
+            break
         state = read_state(left, right)
         top_img = top.grab()
         left_img = cam_l.grab()
@@ -294,6 +352,18 @@ def run_one_attempt(
 
         if n_to_play > 0:
             last_chunk_tail = actions[n_to_play - 1].astype(np.float32).copy()
+    except KeyboardInterrupt:
+        # Let Ctrl-C continue propagating up to main()'s teardown.
+        raise
+    except Exception:
+        # Log the traceback so a transient camera/arm hiccup doesn't vanish
+        # into the os._exit(0) at the bottom of main()'s finally.
+        log.exception("attempt #%d crashed inside control loop", attempt_idx)
+    finally:
+        # Critical: shut down the stdin watcher so it does not steal the
+        # next keystroke at the outcome prompt. Idempotent if it already
+        # fired (because the operator pressed enter).
+        watcher.cancel()
 
     duration_s = time.time() - attempt_start_s
     rtts_np = np.asarray(rtts, dtype=np.float32) if rtts else np.zeros(0, dtype=np.float32)
@@ -312,6 +382,7 @@ def run_one_attempt(
             if state_vs_a0_arm_samples else 0.0,
         "clipped_dim_steps": clipped_dim_steps,
         "max_possible_clip": max_possible_clip,
+        "timed_out": timed_out,
     }
 
 
@@ -397,22 +468,27 @@ def prompt_attempt_outcome() -> tuple[Optional[str], str]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Defaults are sourced from yam_setup_config.json (populated by
+    # identify_setup.py). Re-run identify_setup.py after any hardware swap.
+    _cfg = load_saved_config()
+    _gripper_default = _cfg.get("gripper", "linear_4310")
+
     p = argparse.ArgumentParser(
         description="Interactive task REPL for bimanual YAM + MolmoAct2"
     )
     # Hardware (mirrors yam_client flags so run_repl.sh is a drop-in).
-    p.add_argument("--left-can",  default="can0")
-    p.add_argument("--right-can", default="can1")
-    p.add_argument("--left-gripper",  default="linear_4310",
+    p.add_argument("--left-can",  default=_cfg.get("left_can",  "can0"))
+    p.add_argument("--right-can", default=_cfg.get("right_can", "can1"))
+    p.add_argument("--left-gripper",  default=_gripper_default,
                    choices=["crank_4310", "linear_3507", "linear_4310", "flexible_4310"])
-    p.add_argument("--right-gripper", default="linear_4310",
+    p.add_argument("--right-gripper", default=_gripper_default,
                    choices=["crank_4310", "linear_3507", "linear_4310", "flexible_4310"])
-    p.add_argument("--top-cam-serial",   default=None)
-    p.add_argument("--top-cam-v4l2",     default=None)
-    p.add_argument("--left-cam-serial",  default=None)
-    p.add_argument("--left-cam-v4l2",    default=None)
-    p.add_argument("--right-cam-serial", default=None)
-    p.add_argument("--right-cam-v4l2",   default=None)
+    p.add_argument("--top-cam-serial",   default=_cfg.get("top_cam_serial"))
+    p.add_argument("--top-cam-v4l2",     default=_cfg.get("top_cam_v4l2"))
+    p.add_argument("--left-cam-serial",  default=_cfg.get("left_cam_serial"))
+    p.add_argument("--left-cam-v4l2",    default=_cfg.get("left_cam_v4l2"))
+    p.add_argument("--right-cam-serial", default=_cfg.get("right_cam_serial"))
+    p.add_argument("--right-cam-v4l2",   default=_cfg.get("right_cam_v4l2"))
     p.add_argument("--cam-width",  type=int, default=424)
     p.add_argument("--cam-height", type=int, default=240)
     p.add_argument("--cam-fps",    type=int, default=30)
@@ -488,8 +564,13 @@ def main() -> None:
         cam_r = make_camera("right", args.right_cam_serial, args.right_cam_v4l2, **cam_kw)
         for c in (top, cam_l, cam_r):
             c.start()
+        # AE-settle pass: failures here are tolerated; the in-start warmup
+        # already proved each camera can produce frames, and the first
+        # real grab in the control loop has its own retry/timeout.
         for _ in range(3):
-            top.grab(); cam_l.grab(); cam_r.grab()
+            for c in (top, cam_l, cam_r):
+                try: c.grab()
+                except Exception as e: log.warning("settle: %s.grab() failed: %s", c.name, e)
         trace("cameras streaming, USB quiet -- safe to init arms")
     except Exception:
         for c in (top, cam_l, cam_r):

@@ -1,32 +1,57 @@
 """Bimanual YAM client for the MolmoAct2-BimanualYAM RTC server.
 
-Sister script to scripts/yam_client.py, but talks to the RTC-enabled server
-at :8203 (host_server_rtc.py) and manages the RTC leftover queue per the
-"Real-Time Execution of Action Chunking Flow Policies" recipe
-(Black/Galliker/Levine 2025, arXiv:2506.07339):
+Sister script to scripts/yam_client.py. Implements the executor side of
+Real-Time Chunking (RTC) per Black/Galliker/Levine 2025, arXiv:2506.07339,
+talking to host_server_rtc.py on :8203. Mirrors lerobot's ActionQueue
+semantics (which the client venv can't import directly because i2rt is
+pinned to Python 3.11 and lerobot wants 3.12) with a tiny ClientActionQueue.
 
-  - Bootstrap: synchronous first /act (no leftover), produces chunk #1.
-  - Steady state, every iteration:
-        * Save chunk[exec_horizon : ] as `leftover` for the NEXT request.
-        * Kick off the next /act with that leftover (in background thread).
-        * Execute chunk[0 : exec_horizon] on the arms.
-        * Wait for the next chunk to land; loop.
-  - `inference_delay` is set to an EMA of the last few RTTs (in timesteps);
-    this tells the policy how many timesteps of the leftover overlap with
-    inference time so it can inpaint a smooth handoff.
+Loop architecture (single thread, tick-driven):
 
-To avoid forking the safety harness, we import the well-tested helpers from
-scripts/yam_client.py: SDK lock fix, camera classes, init_arm, read_state,
-safe_command, ramp_to_pose, prompt_journal_entry, write_journal_entry,
-load_training_mean_pose, plus the AsyncInferenceFetcher (subclassed below to
-add the RTC fields). Run with the i2rt venv:
+    every dt:
+        action = queue.pop()                 # one action per tick
+        safe_command(action)                 # clipped per --max-step-rad
+        if inference_in_flight and fetcher.done():
+            new_chunk, rtt = fetcher.collect()
+            real_delay = tick_counter - inference_start_tick
+            delay_buffer.append(real_delay)               # in ticks
+            queue.replace(new_chunk, real_delay)          # discards stale prefix
+            ticks_since_last_inference = 0
+            trigger_threshold = max(max(delay_buffer), s_min)   # paper s = max(d, s_min)
+        if not inference_in_flight and ticks_since_last_inference >= trigger_threshold:
+            kick_off(state, leftover=queue.get_left_over(),
+                     inference_delay=max(delay_buffer))
+
+Paper-faithful invariants:
+
+  * queue.replace(chunk, real_delay) drops chunk[:real_delay] -- those
+    positions correspond to wall-clock that already elapsed during
+    inference (paper Alg. 1 Swap step; lerobot _replace_actions_queue).
+  * leftover sent to the server is the literal unconsumed tail of the
+    in-flight chunk (`original_queue[last_index:]`), NOT a pre-emptive
+    slice. Jitter-robust.
+  * execution_horizon and inference_delay are INDEPENDENT. The CLI flag
+    --execution-horizon corresponds to paper's `s_min` (the user-provided
+    floor on the per-cycle execution horizon, Alg. 1 line 11), NOT paper's
+    `s` directly. The per-request paper_s = H - len(leftover) = (in steady
+    state) real_delay_prev + s_min. inference_delay (= paper's d, predicted
+    from RTT buffer) is the wire field we send per-request. lerobot's
+    `execution_horizon` API arg is set to len(leftover) so the mask fade
+    region ends at the actual leftover boundary (= H - paper_s).
+  * inference_delay estimator uses max(delay_buffer) (paper Alg. 1
+    line 18, `d = max(Q)`), where Q is a deque of past real_delay values
+    measured in CONTROLLER TICKS (paper Alg 1 line 23 pushes `t`, the
+    tick counter at completion -- NOT RTT in ms). Conservative under
+    spikes. Bootstrap seeds the buffer with ceil(boot_rtt_ms/dt_ms).
+
+Run with the i2rt venv:
 
     /home/andon/yam-tests/i2rt/.venv/bin/python experimental/rtc/yam_client_rtc.py \\
         --left-can can0 --right-can can1 \\
         --top-cam-serial AAAA --left-cam-serial BBBB --right-cam-serial CCCC \\
         --server-url http://127.0.0.1:8203/act \\
-        --instruction "first pick up the left orange cube and put it in the box, then pick up the right orange cube and put it in the box" \\
-        --train-fps 30 --execution-horizon 10 --max-step-rad 0.05
+        --instruction "..." \\
+        --train-fps 30 --execution-horizon 8 --max-step-rad 0.05
 
 Safety: same per-tick clip (--max-step-rad / --gripper-step) and same
 return-on-exit ramp as scripts/yam_client.py.
@@ -87,6 +112,10 @@ import requests  # noqa: E402
 
 
 log = logging.getLogger("yam.rtc.client")
+# Legacy yam_client.py sets the root logger to WARNING and only raises
+# `yam.client` to INFO; without this, all our INFO/[summary]/[chunk]/
+# [rtc-bound] lines get silently dropped. Match the legacy client's level.
+log.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +139,17 @@ def post_actions_rtc(
     schedule: Optional[str] = None,
     debug: bool = False,
     seed: Optional[int] = None,
-) -> tuple[np.ndarray, float, dict]:
-    """Round-trip one RTC /act call. Returns (actions[N, D], rtt_ms, server_meta).
+) -> tuple[np.ndarray, np.ndarray, float, dict]:
+    """Round-trip one RTC /act call. Returns
+    (actions[N,D], actions_raw[N,D], rtt_ms, server_meta).
+
+    Two arrays come back:
+      * actions      -- de-normalized joint-space actions to command the arms.
+      * actions_raw  -- raw NORMALIZED policy output, to be sent back as the
+                        next call's `prev_chunk_left_over`. The model's RTC
+                        prefix-attention expects the leftover in normalized
+                        latent space (same scale as the flow-matching
+                        trajectory), so we round-trip the raw form.
 
     server_meta is the 'rtc' field from the server response (echoes back the
     leftover_len_in / execution_horizon / inference_delay / num_steps / the
@@ -156,6 +194,19 @@ def post_actions_rtc(
     if "actions" not in out:
         raise RuntimeError(f"server response missing 'actions': keys={list(out.keys())}")
     actions = np.asarray(out["actions"], dtype=np.float32)
+    # actions_raw: normalized form to be sent back as next leftover. If
+    # absent (e.g. talking to an OLDER server build that doesn't emit it),
+    # fall back to the processed form -- behavior degrades to pre-fix RTC
+    # but doesn't crash.
+    if "actions_raw" in out:
+        actions_raw = np.asarray(out["actions_raw"], dtype=np.float32)
+    else:
+        log.warning(
+            "server response missing 'actions_raw' -- falling back to "
+            "processed actions as the leftover. RTC anchoring will be in "
+            "the wrong space. Update the server to emit actions_raw."
+        )
+        actions_raw = actions.copy()
     server_dt_ms = float(out.get("dt_ms", 0.0))
     server_meta = out.get("rtc", {}) if isinstance(out.get("rtc"), dict) else {}
     rtt_ms = (time.perf_counter() - t0) * 1000.0
@@ -163,7 +214,7 @@ def post_actions_rtc(
         "RTC server dt=%.1f ms, rtt=%.1f ms, shape=%s, server_meta=%s",
         server_dt_ms, rtt_ms, actions.shape, server_meta,
     )
-    return actions, rtt_ms, server_meta
+    return actions, actions_raw, rtt_ms, server_meta
 
 
 class AsyncRTCFetcher:
@@ -220,13 +271,13 @@ class AsyncRTCFetcher:
 
         def _worker():
             try:
-                actions, rtt_ms, meta = post_actions_rtc(
+                actions, actions_raw, rtt_ms, meta = post_actions_rtc(
                     self._url, t, l, r, s, self._instr, self._num_steps,
                     self._timeout_s, pcl, idelay, exh,
                     max_guidance_weight=mgw, schedule=sched,
                     debug=dbg, seed=seed_v,
                 )
-                self._result = (actions, rtt_ms, meta)
+                self._result = (actions, actions_raw, rtt_ms, meta)
             except BaseException as e:  # noqa: BLE001
                 self._error = repr(e)
         self._thread = threading.Thread(target=_worker, daemon=True)
@@ -240,6 +291,126 @@ class AsyncRTCFetcher:
         if self._error is not None:
             raise RuntimeError(f"async /act failed: {self._error}")
         return self._result
+
+    def done(self) -> bool:
+        """Non-blocking: True if a request is in-flight and finished, OR if
+        no request is in-flight (i.e., wait_for_result is safe to call only
+        when there IS an in-flight request, which the caller tracks
+        separately via `inference_in_flight`)."""
+        return self._thread is not None and not self._thread.is_alive()
+
+
+class ClientActionQueue:
+    """Tick-driven action queue mirroring lerobot.policies.rtc.action_queue.
+    ActionQueue's RTC-enabled mode. We can't import lerobot in this venv
+    (Python 3.11 vs lerobot's 3.12 requirement) so we reimplement the
+    minimum needed in pure numpy.
+
+    Two parallel queues (paper Alg. 1 + lerobot action_queue.py:175-194):
+
+      * queue          -- POST-processed (de-normalized joint space) --
+                          consumed by pop() to command the arms.
+      * original_queue -- RAW (normalized latent space) -- returned by
+                          get_left_over() and sent back as the next call's
+                          prev_chunk_left_over. The model's RTC inpainting
+                          expects the leftover in the same NORMALIZED space
+                          as the flow-matching trajectory, not de-normalized
+                          joint space (see lerobot _generate_actions_from_
+                          inputs_with_rtc in modeling_molmoact2.py).
+
+    Three semantics to honor verbatim:
+
+      1. `replace(processed, original, real_delay)` drops first
+         clamped_delay positions from BOTH queues. Those positions
+         correspond to wall-clock time that already elapsed during
+         inference (their mask anchors were to the leftover we *just
+         executed*; replaying them sends the arm back in time -- this is
+         the boundary-jump bug the paper exists to fix).
+      2. `get_left_over()` returns `original_queue[last_index:]` -- the
+         truly unconsumed tail of the in-flight chunk at the moment of
+         the call.
+      3. last_index advances on every pop() and resets to 0 on replace().
+
+    Single-threaded model. The client's main loop owns this object; no
+    threading lock needed.
+    """
+
+    def __init__(self) -> None:
+        self.queue: Optional[np.ndarray] = None           # processed
+        self.original_queue: Optional[np.ndarray] = None  # raw / normalized
+        self.last_index: int = 0
+
+    def replace(self, processed: np.ndarray, original: np.ndarray, real_delay: int) -> int:
+        """Set both queues to `*[real_delay:]`. Returns the clamped
+        delay actually applied (= number of leading positions dropped).
+        Clamp matches lerobot _replace_actions_queue: real_delay is
+        clamped to [0, min(len(processed), len(original))].
+        """
+        if processed is None or len(processed) == 0:
+            self.queue = None
+            self.original_queue = None
+            self.last_index = 0
+            return 0
+        if original is None or len(original) == 0:
+            # Fallback: use processed as both (raw round-trip won't anchor
+            # correctly but the loop still runs).
+            original = processed
+        n = min(len(processed), len(original))
+        clamped = max(0, min(int(real_delay), n))
+        self.queue = np.asarray(processed[clamped:n], dtype=np.float32).copy()
+        self.original_queue = np.asarray(original[clamped:n], dtype=np.float32).copy()
+        self.last_index = 0
+        return clamped
+
+    def pop(self) -> Optional[np.ndarray]:
+        """Pop the next processed action and advance last_index. Returns
+        None if the queue is empty (caller should hold position)."""
+        if self.queue is None or self.last_index >= len(self.queue):
+            return None
+        action = self.queue[self.last_index].copy()
+        self.last_index += 1
+        return action
+
+    def get_left_over(self) -> Optional[np.ndarray]:
+        """Return the currently unconsumed RAW tail (= what to send as
+        prev_chunk_left_over), or None if nothing unconsumed. Mirrors
+        lerobot ActionQueue.get_left_over: returns
+        original_queue[last_index:]."""
+        if self.original_queue is None or self.last_index >= len(self.original_queue):
+            return None
+        return self.original_queue[self.last_index:].copy()
+
+    def qsize(self) -> int:
+        if self.queue is None:
+            return 0
+        return max(0, len(self.queue) - self.last_index)
+
+    def empty(self) -> bool:
+        return self.qsize() == 0
+
+
+def _predict_inference_delay_ticks(
+    delay_buffer: "deque[int]", d_min: int, d_max: int,
+    fixed: Optional[int],
+) -> int:
+    """Estimate inference_delay (in ticks) per RTC paper Alg. 1 line 18:
+    d = max(Q) where Q is a fixed-size buffer of recent inference delays
+    measured in controller ticks (paper Alg. 1 line 23 enqueues `t`, the
+    GetAction counter when inference completes, NOT RTT in ms). For us
+    `t` = real_delay = tick_counter - inference_start_tick at merge.
+    Conservative: take the worst recent value so we don't under-predict
+    under spikes.
+
+    Returns ticks (an int in [d_min, d_max]). If `fixed` is provided,
+    returns it (clamped to [d_min, d_max]). If the buffer is empty,
+    returns d_min.
+    """
+    if fixed is not None:
+        return max(d_min, min(int(fixed), d_max))
+    if len(delay_buffer) == 0:
+        return d_min
+    ticks = int(max(delay_buffer))
+    return max(d_min, min(ticks, d_max))
 
 
 def main() -> None:
@@ -279,63 +450,62 @@ def main() -> None:
                    help="Per-tick gripper clip. Pass 0 to disable.")
     # ----- RTC-specific ---------------------------------------------------
     p.add_argument(
-        "--execution-horizon", type=int, default=DEFAULT_HORIZON_STRIDE,
-        help="BOOTSTRAP value for execution_horizon, used only for the very "
-             "first /act call (before we have an RTT measurement). After "
-             "that, the client adapts execution_horizon to "
-             "ceil(EMA(RTT) / dt), clamped to [--rtc-min-horizon, "
-             "--rtc-max-horizon]. Per the RTC paper's canonical regime, "
-             "execution_horizon and inference_delay are always equal in "
-             "this client -- both control the wall-clock alignment of the "
-             "leftover prefix.",
+        "--execution-horizon", type=int, default=8,
+        help="Paper's s_min (Alg. 1 line 11): how many ticks since the last "
+             "merge before the client kicks off the next inference. "
+             "Default 8 (~266 ms at 30 Hz). Fixed for the whole rollout. "
+             "Trigger: ticks_since_last_inference >= this value. "
+             "NOTE: this is NOT paper's `s` in the mask; the per-request "
+             "paper_s = H - len(leftover), which in steady state equals "
+             "real_delay_prev + this CLI value. Paper's hard constraint is "
+             "d ≤ H - s (Sec 2), enforced per-request by clamping d to "
+             "len(leftover). Paper hints s ≈ H/2 but H/4 (=8) gives more "
+             "room for d-spikes without underflowing the queue.",
     )
     p.add_argument(
-        "--rtc-min-horizon", type=int, default=5,
-        help="Minimum value of the adaptive execution_horizon. Stops the "
-             "system from replanning too aggressively if RTT briefly dips "
-             "(< rtc_min_horizon * dt). Default 5 (~166 ms at 30 Hz).",
+        "--rtc-rtt-buffer-size", type=int, default=8,
+        help="Size of the recent-RTT buffer used to estimate inference_delay "
+             "as max(buffer) / dt (paper Alg. 1 line 18). Bigger = more "
+             "conservative under sporadic spikes; smaller = quicker to "
+             "track latency improvements. Default 8 (~last 8 inferences).",
     )
     p.add_argument(
-        "--rtc-max-horizon", type=int, default=20,
-        help="Maximum value of the adaptive execution_horizon. Stops the "
-             "system from going too far open-loop if RTT spikes "
-             "(> rtc_max_horizon * dt). Default 20 (~666 ms at 30 Hz). "
-             "Must be < chunk_size (=30) so the leftover has positions "
-             "to inpaint over.",
+        "--rtc-inference-delay-fixed", type=int, default=None,
+        help="If set, override the max-of-buffer estimator and pin "
+             "inference_delay to this constant (ticks). Useful for "
+             "reproducing a specific paper-aligned setup or for ablation.",
     )
     p.add_argument(
-        "--inference-delay-mode", default="ema-rtt",
-        choices=["ema-rtt", "fixed", "zero"],
-        help="How to drive the adaptive horizon. "
-             "ema-rtt (default): execution_horizon = inference_delay = "
-             "ceil(EMA(RTT)/dt), as the RTC paper assumes. "
-             "fixed: both quantities pinned to --inference-delay-fixed. "
-             "zero: inference_delay forced to 0 (DIAGNOSTIC ABLATION -- "
-             "disables prefix anchoring entirely, degenerates to vanilla "
-             "chunked inference; useful for separating RTC's contribution "
-             "from raw async-chunking).",
+        "--rtc-zero-delay", action="store_true",
+        help="DIAGNOSTIC ABLATION: force inference_delay = 0. The mask's "
+             "frozen prefix region is empty, so the new chunk is anchored "
+             "to the leftover ONLY via the fade region. Degenerates RTC "
+             "toward vanilla chunked inference; useful for separating "
+             "RTC's contribution from raw async-chunking.",
     )
     p.add_argument(
-        "--inference-delay-fixed", type=int, default=10,
-        help="If --inference-delay-mode=fixed, use this constant for both "
-             "execution_horizon and inference_delay.",
+        "--rtc-min-inference-delay", type=int, default=1,
+        help="Lower clamp on inference_delay. Default 1.",
     )
     p.add_argument(
-        "--inference-delay-ema-alpha", type=float, default=0.5,
-        help="EMA smoothing factor for the RTT estimate (0..1, higher = "
-             "more reactive to recent latency).",
+        "--rtc-max-inference-delay", type=int, default=None,
+        help="Upper clamp on inference_delay. Default (None) = auto-compute "
+             "as (chunk_size - execution_horizon) // 2 so the per-cycle "
+             "consumption s + d <= H - d (paper Sec 2 constraint). With "
+             "H=30, s=8, this defaults to 11.",
     )
     p.add_argument(
         "--rtc-max-guidance-weight", type=float, default=None,
-        help="Per-request override for RTCConfig.max_guidance_weight. If "
-             "unset, uses the server's RTCConfig default (10.0). Higher = "
-             "tighter prefix anchoring; lower = more model freedom near "
-             "chunk boundaries.",
+        help="Per-request override for RTCConfig.max_guidance_weight (β). "
+             "If unset, uses the server's default (10.0; this matches "
+             "lerobot's RTCConfig default, which the paper does not pin "
+             "to a specific value). Higher β = tighter prefix anchoring; "
+             "lower = more model freedom near chunk boundaries.",
     )
     p.add_argument(
         "--rtc-schedule", default=None, choices=[None, "linear", "exp", "zeros", "ones"],
         help="Per-request override for prefix_attention_schedule. If unset, "
-             "uses the server's default (LINEAR, the paper's recommendation).",
+             "uses the server's default (EXP, matching paper Eq. 5).",
     )
     p.add_argument(
         "--rtc-debug", action="store_true",
@@ -396,9 +566,9 @@ def main() -> None:
                 health["rtc"].get("max_guidance_weight"),
             )
             # The server's reported execution_horizon is just the RTCConfig
-            # default; the client overrides it on every request with the
-            # adaptive value from _compute_horizon_and_delay(). So a mismatch
-            # at boot is expected and not a warning condition.
+            # boot-time default; the client overrides it per request with
+            # `len(leftover)` (= mask fade end). So a mismatch at boot is
+            # expected and not a warning condition.
     except Exception as e:
         log.error("server health check failed at %s: %s", args.server_url, e)
         sys.exit(2)
@@ -453,21 +623,23 @@ def main() -> None:
     inner_dt = 1.0 / args.train_fps
     log.info(
         "RTC control loop: train_fps=%.1f Hz, execution_horizon=%d, "
-        "inference_delay_mode=%s, instruction=%r",
-        args.train_fps, args.execution_horizon, args.inference_delay_mode,
-        args.instruction,
+        "instruction=%r", args.train_fps, args.execution_horizon, args.instruction,
     )
 
     # ---- Warmup the server once at the real image shape --------------------
+    # The warmup also tells us H (chunk_size) from the server's response so
+    # we can validate the inference_delay clamp range against it.
+    chunk_size_from_server: Optional[int] = None
     try:
         state = read_state(left, right)
         log.info("Warming up server (timeout=%.0fs)...", args.warmup_timeout_s)
-        _wu_actions, _wu_rtt, _wu_meta = post_actions_rtc(
+        _wu_actions, _wu_raw, _wu_rtt, _wu_meta = post_actions_rtc(
             args.server_url, top.grab(), cam_l.grab(), cam_r.grab(), state,
             args.instruction, args.num_steps, args.warmup_timeout_s,
             prev_chunk_left_over=None, inference_delay=0,
             execution_horizon=args.execution_horizon,
         )
+        chunk_size_from_server = int(_wu_actions.shape[0])
         log.info(
             "Server warmup OK (rtt=%.0f ms, actions shape=%s, server_meta=%s)",
             _wu_rtt, _wu_actions.shape, _wu_meta,
@@ -475,58 +647,69 @@ def main() -> None:
     except Exception as e:
         log.error("server warmup failed: %s. Continuing anyway.", e)
 
-    # ---- Adaptive horizon estimator -----------------------------------------
-    # The RTC paper assumes execution_horizon == inference_delay in steady
-    # state -- the new chunk is generated to start exactly where the
-    # currently-executing chunk would be after `inference_delay` timesteps,
-    # and we hand it off the moment the previous chunk reaches that point.
-    # That assumption is correct iff
-    #
-    #     execution_horizon * dt  ==  RTT  ==  inference_delay * dt
-    #
-    # If they disagree, the leftover slice (= current_chunk[execution_horizon:])
-    # refers to a wall-clock instant different from what chunk_N+1[0]
-    # corresponds to, and the prefix attention anchors to the wrong
-    # timestep. So we make both adapt to measured RTT:
-    #
-    #     execution_horizon = inference_delay = ceil(RTT_ema / dt)
-    #
-    # clamped to [rtc_min_horizon, rtc_max_horizon] so we never replan too
-    # often (causing thrash) or too rarely (long open-loop windows). Both
-    # ends are exposed as CLI flags below.
-    rtt_ema_ms: Optional[float] = None
-
-    def _compute_horizon_and_delay() -> tuple[int, int]:
-        """Return (execution_horizon, inference_delay), always equal in this
-        client. Falls back to args.execution_horizon (the bootstrap value)
-        until rtt_ema_ms has been initialized.
-        """
-        if args.inference_delay_mode == "fixed":
-            h = max(1, int(args.inference_delay_fixed))
-            return h, h
-        if args.inference_delay_mode == "zero":
-            # Diagnostic ablation: degenerate to non-prefix behaviour.
-            # inference_delay=0 means no prefix anchoring; execution_horizon
-            # still controls how many actions we play per chunk.
-            return max(1, int(args.execution_horizon)), 0
-        # ema-rtt (default): both quantities track ceil(RTT / dt).
-        if rtt_ema_ms is None:
-            h = max(1, int(args.execution_horizon))
-            return h, h
-        dt_ms = inner_dt * 1000.0
-        h = int(np.ceil(rtt_ema_ms / dt_ms))
-        h = max(args.rtc_min_horizon, min(h, args.rtc_max_horizon))
-        return h, h
+    # ---- Compute inference_delay bounds ------------------------------------
+    # Paper's HARD constraint (Sec 2): d ≤ H - s. Rearranged: s ≤ H - d.
+    # Per-request paper_s = H - len(leftover), so the binding form is:
+    #     d ≤ len(leftover)
+    # We compute this per kick-off (see _per_request_d_max below). The
+    # STATIC bounds here are just safety floor/ceiling; the dynamic
+    # per-request clamp does the real work. The static ceiling defaults
+    # to (H - s_min) // 2 -- the stable steady-state fixed point assuming
+    # d_prev ≈ d_current.
+    H_chunk = chunk_size_from_server if chunk_size_from_server else 30
+    auto_d_static = max(1, (H_chunk - int(args.execution_horizon)) // 2)
+    d_max_static = int(args.rtc_max_inference_delay) if args.rtc_max_inference_delay is not None else auto_d_static
+    d_min = max(0, int(args.rtc_min_inference_delay))
+    if d_min > d_max_static:
+        log.warning(
+            "rtc_min_inference_delay=%d > rtc_max_inference_delay=%d; "
+            "swapping the latter up", d_min, d_max_static,
+        )
+        d_max_static = d_min
+    log.info(
+        "inference_delay bounds: static=[%d, %d] ticks  per-request d_max "
+        "is clamped to min(d_max_static, len(leftover))  (chunk_size H=%d, "
+        "s_min=%d, fixed=%s, zero_delay=%s)",
+        d_min, d_max_static, H_chunk, args.execution_horizon,
+        args.rtc_inference_delay_fixed, args.rtc_zero_delay,
+    )
 
     # ---- RTC state machine --------------------------------------------------
-    # We always run async (RTC's whole point is to overlap inference with
-    # execution). There's no sync mode here -- if you want sync, use the
-    # legacy yam_client.
     fetcher = AsyncRTCFetcher(
         args.server_url, args.instruction, args.num_steps, args.timeout_s,
     )
+    queue = ClientActionQueue()
+    # Buffer of recent inference durations IN TICKS (paper Alg 1 line 23).
+    # At each merge we push real_delay = tick_counter - inference_start_tick.
+    delay_buffer: deque[int] = deque(maxlen=max(1, int(args.rtc_rtt_buffer_size)))
 
-    # Bootstrap: synchronous first chunk, no leftover.
+    def _predict_d_static() -> int:
+        """d_pred for trigger-threshold computation (max(d_pred, s_min)
+        per paper Alg 1's s = max(d, s_min)). Uses the STATIC d_max
+        ceiling -- the per-request dynamic clamp only kicks in at
+        kick_off when we know len(leftover)."""
+        if args.rtc_zero_delay:
+            return 0
+        return _predict_inference_delay_ticks(
+            delay_buffer, d_min, d_max_static,
+            args.rtc_inference_delay_fixed,
+        )
+
+    def _predict_d(leftover_len: int) -> int:
+        """Paper-faithful per-request d at kick_off time. Hard constraint
+        d ≤ len(leftover) (equivalent to d ≤ H - paper_s where paper_s =
+        H - len(leftover)). Also clamp by the static ceiling for sanity."""
+        if args.rtc_zero_delay:
+            return 0
+        if leftover_len <= 0:
+            return 0  # nothing to anchor; pure flow-matching
+        d_max_dynamic = min(d_max_static, int(leftover_len))
+        return _predict_inference_delay_ticks(
+            delay_buffer, d_min, d_max_dynamic,
+            args.rtc_inference_delay_fixed,
+        )
+
+    # Bootstrap: synchronous first chunk, no leftover, no discard.
     log.info("RTC bootstrap: fetching initial chunk (no leftover)...")
     bootstrap_state = read_state(left, right)
     bootstrap_top = top.grab()
@@ -541,155 +724,306 @@ def main() -> None:
         debug=args.rtc_debug,
         seed=args.seed,
     )
-    current_chunk, last_rtt_ms, last_meta = fetcher.wait_for_result()
-    rtt_ema_ms = float(last_rtt_ms)
+    boot_chunk, boot_chunk_raw, boot_rtt_ms, boot_meta = fetcher.wait_for_result()
+    # Seed the tick-delay buffer with the bootstrap RTT converted to ticks.
+    # Bootstrap is synchronous so there's no `real_delay` in the main-loop
+    # sense; ceil(boot_rtt_ms / dt_ms) is the closest tick-count we have.
+    boot_delay_ticks = max(0, int(np.ceil(float(boot_rtt_ms) / (inner_dt * 1000.0))))
+    delay_buffer.append(boot_delay_ticks)
+    queue.replace(boot_chunk, boot_chunk_raw, real_delay=0)
     log.info(
-        "Bootstrap chunk OK: shape=%s, rtt=%.0fms, meta=%s",
-        current_chunk.shape, last_rtt_ms, last_meta,
+        "Bootstrap chunk OK: shape=%s, raw_shape=%s, rtt=%.0fms (=%d ticks), "
+        "queue_len=%d, meta=%s",
+        boot_chunk.shape, boot_chunk_raw.shape, boot_rtt_ms,
+        boot_delay_ticks, queue.qsize(), boot_meta,
     )
 
+    # ---- Tick-driven control loop ------------------------------------------
+    # Single thread. Every dt:
+    #   * pop one action (or hold if underflow);
+    #   * if a request is in flight and done -> merge with real_delay;
+    #   * if no request in flight and exec horizon reached -> kick off next.
     stop_flag = {"stop": False}
+    tick_counter = 0
+    ticks_since_last_inference = 0
+    inference_in_flight = False
+    inference_start_tick = 0
+    last_kickoff_d_predicted = 0
+    last_action_played: Optional[np.ndarray] = None
     boundary_idx = 0
-    last_chunk_tail: Optional[np.ndarray] = None
+    last_rtt_ms = float(boot_rtt_ms)
+    clipped_total = 0
+    steps_total = 0
+    underflow_ticks = 0
+    last_paper_s_sent = 0  # paper_s = H - len(leftover) on the most recent kick_off
+    # Per-cycle accounting (reset at every merge).
+    ticks_played_cycle = 0
+    ticks_held_cycle = 0
+    state_at_last_merge: Optional[np.ndarray] = read_state(left, right)
+    # Rolling summary state (lifetime; never reset).
+    rtt_history: deque[float] = deque(maxlen=200)
+    rtt_history.append(float(boot_rtt_ms))
+    chunk_arm_span_history: deque[float] = deque(maxlen=200)
+    cycles_completed = 0
+    duty_played_total = 0
+    duty_held_total = 0
+    last_summary_tick = 0
+    SUMMARY_EVERY_TICKS = max(1, int(round(5.0 / inner_dt)))  # ~5 s
+    # Initial trigger threshold = max(d_pred_from_boot, s_min). Paper Alg 1:
+    # s = max(d, s_min). Recomputed after every merge.
+    trigger_threshold = max(_predict_d_static(), int(args.execution_horizon))
+    log.info(
+        "Initial trigger_threshold = max(d_pred=%d, s_min=%d) = %d ticks",
+        _predict_d_static(), int(args.execution_horizon), trigger_threshold,
+    )
+
+    arm_idx = np.r_[0:6, 7:13]
 
     try:
         while not stop_flag["stop"]:
-            # Adaptive horizon: both quantities derived from measured RTT.
-            # execution_horizon controls BOTH where we slice the leftover
-            # AND how many actions we play before re-querying. Keeping them
-            # equal to inference_delay ensures wall-clock alignment.
-            exec_horizon, inference_delay = _compute_horizon_and_delay()
-            chunk_len = current_chunk.shape[0]
-            n_to_play = min(exec_horizon, chunk_len)
+            step_start = time.perf_counter()
+            tick_counter += 1
+            ticks_since_last_inference += 1
 
-            # ---- Prepare next-request inputs (NOW, before executing) ------
-            # We send the NEXT chunk's leftover prefix
-            # (= current_chunk[exec_horizon:]) so the policy can inpaint a
-            # smooth handoff. The state is sampled at the moment of kick-off
-            # (= the wall-clock instant chunk_N+1[0] represents in the
-            # canonical RTC regime).
-            next_state = read_state(left, right)
-            next_top = top.grab()
-            next_left = cam_l.grab()
-            next_right = cam_r.grab()
+            # Single CAN read per tick (state is used by the clip in
+            # safe_command, by underflow-hold fallback, and by boundary
+            # telemetry).
+            state_now = read_state(left, right)
 
-            # Leftover = unexecuted tail of the current chunk. Shape:
-            # (chunk_size - exec_horizon, action_dim). RTC processor pads
-            # this back up to chunk_size with zeros internally.
-            leftover = (
-                current_chunk[exec_horizon:].astype(np.float32, copy=True)
-                if chunk_len > exec_horizon else None
-            )
-
-            # ---- Per-query diagnostics on the CURRENT chunk ---------------
-            def _arm_delta_max(a_idx: int) -> float:
-                d = current_chunk[a_idx] - next_state
-                return float(max(np.max(np.abs(d[:6])), np.max(np.abs(d[7:13]))))
-            a0_d  = _arm_delta_max(0)
-            a5_d  = _arm_delta_max(min(5, chunk_len - 1))
-            a10_d = _arm_delta_max(min(10, chunk_len - 1))
-            a19_d = _arm_delta_max(min(19, chunk_len - 1))
-            aN_d  = _arm_delta_max(chunk_len - 1)
-            horizon_range = current_chunk.max(axis=0) - current_chunk.min(axis=0)
-            horizon_arm_span = float(max(
-                np.max(horizon_range[:6]), np.max(horizon_range[7:13]),
-            ))
-            log.info(
-                "/act rtt=%dms  arm |a[i]-state|_max @ 0/5/10/19/last: "
-                "%.3f/%.3f/%.3f/%.3f/%.3f rad  horizon_span=%.3f rad  "
-                "L_grip[0,last]=%.2f,%.2f  R_grip[0,last]=%.2f,%.2f  "
-                "leftover_len_out=%d  inference_delay=%d",
-                last_rtt_ms, a0_d, a5_d, a10_d, a19_d, aN_d, horizon_arm_span,
-                current_chunk[0][6], current_chunk[-1][6],
-                current_chunk[0][13], current_chunk[-1][13],
-                0 if leftover is None else len(leftover),
-                inference_delay,
-            )
-
-            # ---- Boundary telemetry --------------------------------------
-            # state_vs_a0: how far the about-to-execute action is from the
-            # arm's actual position right now. RTC's whole point is to keep
-            # this small even when inference is slow.
-            # tail_vs_a0: how far the new chunk's a[0] is from the LAST raw
-            # action we sent (= last_chunk_tail). RTC should also keep this
-            # small (prefix attention to leftover).
-            if last_chunk_tail is not None:
-                arm_idx = np.r_[0:6, 7:13]
-                a0 = current_chunk[0]
-                state_vs_a0_arm = float(np.max(np.abs(a0[arm_idx] - next_state[arm_idx])))
-                tail_vs_a0_arm = float(np.max(np.abs(a0[arm_idx] - last_chunk_tail[arm_idx])))
-                state_vs_a0_grip_l = float(abs(a0[6] - next_state[6]))
-                state_vs_a0_grip_r = float(abs(a0[13] - next_state[13]))
-                boundary_idx += 1
-                log.info(
-                    "[rtc-boundary] #%d  state_vs_a0(arm)=%.3f rad  "
-                    "tail_vs_a0(arm)=%.3f rad  state_vs_a0(grip L,R)=%.2f,%.2f",
-                    boundary_idx, state_vs_a0_arm, tail_vs_a0_arm,
-                    state_vs_a0_grip_l, state_vs_a0_grip_r,
-                )
-
-            # ---- Kick off the next /act in the background ----------------
-            try:
-                fetcher.kick_off(
-                    next_state, next_top, next_left, next_right,
-                    prev_chunk_left_over=leftover,
-                    inference_delay=inference_delay,
-                    execution_horizon=exec_horizon,
-                    max_guidance_weight=args.rtc_max_guidance_weight,
-                    schedule=args.rtc_schedule,
-                    debug=args.rtc_debug,
-                    seed=args.seed,
-                )
-            except RuntimeError as e:
-                log.error("kick_off failed: %s", e)
-                break
-
-            # ---- Execute current_chunk[0 : exec_horizon] -----------------
-            clipped_this_query = 0
-            steps_this_query = 0
-            for i in range(n_to_play):
-                if stop_flag["stop"]:
-                    break
-                step_start = time.perf_counter()
-                desired = current_chunk[i].astype(np.float32)
-                if args.dry_run:
-                    log.info("dry-run action[%d]: %s", i,
-                             np.array2string(desired, precision=3))
-                else:
-                    state = read_state(left, right)
-                    _, n_clipped = safe_command(
-                        left, right, state, desired,
-                        args.max_step_rad, args.gripper_step,
-                    )
-                    clipped_this_query += n_clipped
-                    steps_this_query += 1
-                sleep_left = inner_dt - (time.perf_counter() - step_start)
-                if sleep_left > 0:
-                    time.sleep(sleep_left)
-                elif sleep_left < -0.050:
+            # ---- Pop next action and command -----------------------------
+            desired = queue.pop()
+            if desired is None:
+                underflow_ticks += 1
+                ticks_held_cycle += 1
+                duty_held_total += 1
+                # Hold position: command the current state (zero motion).
+                desired = state_now.copy().astype(np.float32)
+                if underflow_ticks == 1 or underflow_ticks % 30 == 0:
                     log.warning(
-                        "inner step overrun by %.1f ms (target %.1f ms)",
-                        -sleep_left * 1000.0, inner_dt * 1000.0,
+                        "queue underflow (tick=%d, since-last-inference=%d): "
+                        "holding state. Inference is slower than the "
+                        "execution horizon allows.",
+                        tick_counter, ticks_since_last_inference,
                     )
-            if steps_this_query > 0 and (args.max_step_rad > 0 or args.gripper_step > 0):
-                max_possible = STATE_DIM * steps_this_query
-                if clipped_this_query > 0:
-                    pct = 100.0 * clipped_this_query / max_possible
+            else:
+                ticks_played_cycle += 1
+                duty_played_total += 1
+
+            if args.dry_run:
+                log.info("dry-run tick=%d action: %s", tick_counter,
+                         np.array2string(desired, precision=3))
+            else:
+                _, n_clipped = safe_command(
+                    left, right, state_now, desired,
+                    args.max_step_rad, args.gripper_step,
+                )
+                clipped_total += n_clipped
+                steps_total += 1
+            last_action_played = desired.copy()
+
+            # ---- Collect in-flight inference if it just finished ---------
+            if inference_in_flight and fetcher.done():
+                try:
+                    new_chunk, new_chunk_raw, rtt_ms, meta = fetcher.wait_for_result()
+                except Exception as e:  # noqa: BLE001
+                    log.error("inference returned with error: %s", e)
+                    break
+                real_delay = tick_counter - inference_start_tick
+                delay_buffer.append(int(real_delay))
+                last_rtt_ms = float(rtt_ms)
+                rtt_history.append(float(rtt_ms))
+                clamped_delay = queue.replace(new_chunk, new_chunk_raw, real_delay)
+                # Snapshot per-cycle counters BEFORE resetting.
+                played_this_cycle = int(ticks_played_cycle)
+                held_this_cycle = int(ticks_held_cycle)
+                cycle_total = played_this_cycle + held_this_cycle
+                duty_pct = (100.0 * played_this_cycle / cycle_total) if cycle_total > 0 else 0.0
+                # State progress: how far the arm physically moved since the
+                # last merge.
+                if state_at_last_merge is not None:
+                    state_progress_arm = float(np.max(np.abs(
+                        state_now[arm_idx] - state_at_last_merge[arm_idx]
+                    )))
+                else:
+                    state_progress_arm = 0.0
+                state_at_last_merge = state_now.copy()
+                # Reset cycle counters.
+                ticks_played_cycle = 0
+                ticks_held_cycle = 0
+                ticks_since_last_inference = 0
+                inference_in_flight = False
+                cycles_completed += 1
+                # Recompute the trigger threshold for the new cycle
+                # (paper Alg 1: s = max(d, s_min)).
+                trigger_threshold = max(_predict_d_static(), int(args.execution_horizon))
+
+                # Pull server-side timing breakdown (item F).
+                srv_pre = float(meta.get("dt_pre_ms", 0.0))
+                srv_inf = float(meta.get("dt_inf_ms", 0.0))
+                srv_post = float(meta.get("dt_post_ms", 0.0))
+
+                # Per-cycle chunk diagnostics: arm-joint delta from CURRENT
+                # state at chunk positions 0/5/10/15/29 (item C). Tells us
+                # where the model wants the arm to go relative to "now".
+                # NOTE: queue.queue is the post-discard array, so index 0
+                # is the first action we'll play; "29" maps to the last
+                # action of the original chunk.
+                if queue.queue is not None and len(queue.queue) > 0:
+                    qq = queue.queue
+                    H_q = len(qq)
+                    def _delta(i):
+                        if i >= H_q: i = H_q - 1
+                        return float(np.max(np.abs(qq[i][arm_idx] - state_now[arm_idx])))
+                    deltas = [_delta(i) for i in (0, 5, 10, 15, H_q - 1)]
+                    horizon_range = qq.max(axis=0) - qq.min(axis=0)
+                    horizon_arm_span = float(max(
+                        np.max(horizon_range[:6]), np.max(horizon_range[7:13]),
+                    ))
+                    chunk_arm_span_history.append(horizon_arm_span)
                     log.info(
-                        "clip: %d/%d dim-steps clipped (%.1f%%) "
-                        "[--max-step-rad=%.3f --gripper-step=%.3f]",
-                        clipped_this_query, max_possible, pct,
-                        args.max_step_rad, args.gripper_step,
+                        "[chunk] #%d span=%.3f delta@0/5/10/15/last=%.3f/%.3f/%.3f/%.3f/%.3f rad",
+                        cycles_completed, horizon_arm_span,
+                        deltas[0], deltas[1], deltas[2], deltas[3], deltas[4],
+                    )
+                else:
+                    horizon_arm_span = 0.0
+
+                # Boundary line (items A + D + E folded together).
+                # last_action_played = what we COMMANDED on the previous
+                # tick. If we were underflowing right before merge, it's
+                # = state_now (held). So `held_vs_a0` and `tail_vs_a0` are
+                # the same in that case; the boundary log line shows both
+                # so you can tell whether the recovery was smooth.
+                if last_action_played is not None and queue.queue is not None and len(queue.queue) > 0:
+                    a0_post = queue.queue[0]
+                    state_vs_a0_arm = float(np.max(np.abs(a0_post[arm_idx] - state_now[arm_idx])))
+                    tail_vs_a0_arm = float(np.max(np.abs(a0_post[arm_idx] - last_action_played[arm_idx])))
+                    state_vs_a0_grip_l = float(abs(a0_post[6] - state_now[6]))
+                    state_vs_a0_grip_r = float(abs(a0_post[13] - state_now[13]))
+                    held_vs_a0_arm = state_vs_a0_arm if held_this_cycle > 0 else float('nan')
+                    real_pred_delta = int(real_delay - last_kickoff_d_predicted)
+                    # Absolute gripper positions: state[6,13] = current arm grippers,
+                    # a0[6,13] = first commanded value, qq[-1][6,13] = end-of-chunk
+                    # commanded value. So you can see "is the chunk telling the
+                    # grippers to close (~0) or open (~1) right now and over the
+                    # chunk?" instead of just the delta from state.
+                    qq_end = queue.queue[-1]
+                    boundary_idx += 1
+                    log.info(
+                        "[rtc-bound] #%d rtt=%.0f d_pred=%d real=%d Δ=%+d "
+                        "paper_s=%d ply/hld=%d/%d duty=%.0f%% "
+                        "s_vs_a0=%.3f t_vs_a0=%.3f h_vs_a0=%s "
+                        "g_state(L,R)=%.2f,%.2f g_a0(L,R)=%.2f,%.2f "
+                        "g_end(L,R)=%.2f,%.2f g_diff_a0=%.2f,%.2f "
+                        "q=%d arm_prog=%.3f srv pre/inf/post=%.0f/%.0f/%.0f",
+                        boundary_idx, rtt_ms, last_kickoff_d_predicted,
+                        real_delay, real_pred_delta,
+                        last_paper_s_sent, played_this_cycle, held_this_cycle,
+                        duty_pct,
+                        state_vs_a0_arm, tail_vs_a0_arm,
+                        ("%.3f" % held_vs_a0_arm) if held_this_cycle > 0 else "n/a",
+                        float(state_now[6]), float(state_now[13]),
+                        float(a0_post[6]), float(a0_post[13]),
+                        float(qq_end[6]), float(qq_end[13]),
+                        state_vs_a0_grip_l, state_vs_a0_grip_r,
+                        queue.qsize(), state_progress_arm,
+                        srv_pre, srv_inf, srv_post,
                     )
 
-            # Stash the last raw action we played for the next boundary check.
-            last_chunk_tail = current_chunk[n_to_play - 1].astype(np.float32).copy()
+            # ---- Kick off next inference if trigger threshold hit -------
+            # Paper Alg 1: s = max(d, s_min). Threshold updated at every
+            # merge from `trigger_threshold = max(_predict_d_static(),
+            # args.execution_horizon)`.
+            if (not inference_in_flight) and (ticks_since_last_inference >= trigger_threshold):
+                kick_state = state_now  # reuse the read from earlier this tick
+                kick_top = top.grab()
+                kick_left = cam_l.grab()
+                kick_right = cam_r.grab()
 
-            # ---- Wait for the next chunk (in-flight) ---------------------
-            current_chunk, last_rtt_ms, last_meta = fetcher.wait_for_result()
-            # Update the RTT EMA.
-            alpha = float(args.inference_delay_ema_alpha)
-            rtt_ema_ms = alpha * float(last_rtt_ms) + (1.0 - alpha) * float(rtt_ema_ms)
+                # Leftover = currently unconsumed tail. lerobot's API arg
+                # `execution_horizon` is actually the END of the fade region
+                # in the prefix mask (NOT the paper's s). Setting it to
+                # len(leftover) means the mask is:
+                #   ones(d_pred), fade(d_pred -> len(leftover)),
+                #   zeros(len(leftover) -> H)
+                # which matches the paper's Eq. 5 with H - s_paper aligned
+                # to the actual leftover boundary (paper-faithful given that
+                # leftover already excludes the discarded prefix from the
+                # prior merge).
+                leftover_arr = queue.get_left_over()
+                lerobot_exec_horizon = (
+                    int(len(leftover_arr)) if leftover_arr is not None else 0
+                )
+                d_pred = _predict_d(lerobot_exec_horizon)
+                last_kickoff_d_predicted = d_pred
+                paper_s_this = H_chunk - lerobot_exec_horizon
+                last_paper_s_sent = paper_s_this
+
+                try:
+                    fetcher.kick_off(
+                        kick_state, kick_top, kick_left, kick_right,
+                        prev_chunk_left_over=leftover_arr,
+                        inference_delay=d_pred,
+                        execution_horizon=lerobot_exec_horizon,
+                        max_guidance_weight=args.rtc_max_guidance_weight,
+                        schedule=args.rtc_schedule,
+                        debug=args.rtc_debug,
+                        seed=args.seed,
+                    )
+                except RuntimeError as e:
+                    log.error("kick_off failed: %s", e)
+                    break
+                inference_in_flight = True
+                inference_start_tick = tick_counter
+                log.debug(
+                    "kicked off /act: leftover_len=%d  paper_s=%d  "
+                    "d_pred=%d  ticks_since_merge=%d  tick=%d",
+                    lerobot_exec_horizon, paper_s_this, d_pred,
+                    ticks_since_last_inference, tick_counter,
+                )
+
+            # ---- Tick rate -----------------------------------------------
+            sleep_left = inner_dt - (time.perf_counter() - step_start)
+            if sleep_left > 0:
+                time.sleep(sleep_left)
+            elif sleep_left < -0.050:
+                log.warning(
+                    "inner step overrun by %.1f ms (target %.1f ms)",
+                    -sleep_left * 1000.0, inner_dt * 1000.0,
+                )
+
+            # ---- Rolling summary every ~5 s (item B) ---------------------
+            if tick_counter - last_summary_tick >= SUMMARY_EVERY_TICKS:
+                last_summary_tick = tick_counter
+                elapsed_s = tick_counter * inner_dt
+                # RTT percentiles over rolling window
+                if len(rtt_history) > 0:
+                    rtts = sorted(rtt_history)
+                    n = len(rtts)
+                    p50 = rtts[n // 2]
+                    p95 = rtts[min(n - 1, int(0.95 * (n - 1)))]
+                    rmax = rtts[-1]
+                else:
+                    p50 = p95 = rmax = 0.0
+                # Duty cycle (lifetime)
+                duty_total = duty_played_total + duty_held_total
+                duty_pct_total = (100.0 * duty_played_total / duty_total) if duty_total > 0 else 0.0
+                mean_span = (
+                    sum(chunk_arm_span_history) / len(chunk_arm_span_history)
+                    if len(chunk_arm_span_history) > 0 else 0.0
+                )
+                # Clip rate
+                clip_pct = 0.0
+                if steps_total > 0 and (args.max_step_rad > 0 or args.gripper_step > 0):
+                    clip_pct = 100.0 * clipped_total / (STATE_DIM * steps_total)
+                log.info(
+                    "[summary] t=%.0fs cycles=%d rtt p50/p95/max=%.0f/%.0f/%.0f "
+                    "mean_span=%.2f duty=%.0f%% underflows=%d clip=%.1f%% "
+                    "d_pred=%d thresh=%d",
+                    elapsed_s, cycles_completed, p50, p95, rmax,
+                    mean_span, duty_pct_total, underflow_ticks, clip_pct,
+                    _predict_d_static(), trigger_threshold,
+                )
 
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt -- shutting down")

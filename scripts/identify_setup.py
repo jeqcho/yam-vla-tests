@@ -84,8 +84,8 @@ def _quiet_close(robot) -> None:
 CONFIG_PATH = Path("/home/andon/yam-tests/molmoact2-setup/yam_setup_config.json")
 WRIST_ROLL_J = 5     # 0-indexed; spins end-effector in place, safest joint to wiggle
 WIGGLE_AMP = 0.3     # rad ~ 17 deg
-WIGGLE_CYCLES = 3
-WIGGLE_HZ = 0.7
+WIGGLE_CYCLES = 2    # was 3 at 0.7 Hz (~4.3 s) -- 2 at 1.0 Hz = 2 s, plenty
+WIGGLE_HZ = 1.0      #   to see which arm moved
 CMD_HZ = 30.0
 
 
@@ -172,10 +172,24 @@ def identify_arms(can_a: str, can_b: str, gripper: str) -> dict:
 
 # ---------------- camera identification ----------------
 
-def list_realsense() -> list[str]:
+def list_realsense() -> list[tuple[str, str]]:
+    """Return [(serial, model_name), ...] for all RealSense devices.
+
+    Model name comes from rs.camera_info.name, e.g. 'Intel RealSense D435'.
+    This rig uses D435 (wide FOV) for the top/context camera and D405s for
+    the wrist cameras; identify_cameras warns if that pairing isn't met.
+    """
     import pyrealsense2 as rs
     ctx = rs.context()
-    return [dev.get_info(rs.camera_info.serial_number) for dev in ctx.query_devices()]
+    out = []
+    for dev in ctx.query_devices():
+        serial = dev.get_info(rs.camera_info.serial_number)
+        try:
+            model = dev.get_info(rs.camera_info.name)
+        except Exception:
+            model = "(unknown)"
+        out.append((serial, model))
+    return out
 
 
 def list_v4l2_uvc() -> list[str]:
@@ -275,76 +289,137 @@ def count_orange_pixels(img_rgb: np.ndarray) -> int:
 
 def identify_cameras() -> dict:
     print(f"\n=== Camera identification ===")
-    rs_serials = list_realsense()
+    rs_devices = list_realsense()                       # [(serial, model), ...]
+    rs_serials = [s for s, _ in rs_devices]
+    rs_model_by_serial = dict(rs_devices)
     uvc_devs = list_v4l2_uvc()
-    print(f"  Found RealSense serials: {rs_serials}")
+    print(f"  Found RealSense devices:")
+    for serial, model in rs_devices:
+        print(f"    {serial}  ({model})")
     print(f"  Found UVC (webcam) devices: {uvc_devs}")
 
-    if len(rs_serials) != 2:
-        print(f"WARNING: expected 2 RealSense cameras, found {len(rs_serials)}.")
-        if len(rs_serials) < 2:
-            raise RuntimeError("Cannot identify left/right without 2 RealSense cameras.")
+    # Partition by model: this rig uses D435 (wide FOV) as the top/context
+    # camera and D405 as wrist cameras. Picking top by model is far more
+    # robust than triangulating it from the orange-cube test, which the user
+    # has already been bitten by once.
+    def _is(model: str, substr: str) -> bool:
+        return substr in (model or "")
 
-    if not uvc_devs:
-        print("WARNING: no UVC webcam found; top camera will be left unset.")
-        top_dev = None
-    else:
+    d435s = [s for s, m in rs_devices if _is(m, "D435")]
+    d405s = [s for s, m in rs_devices if _is(m, "D405")]
+
+    # Top camera assignment (model-based).
+    top_serial: Optional[str] = None
+    top_v4l2: Optional[str] = None
+    if d435s:
+        top_serial = d435s[0]
+        if len(d435s) > 1:
+            print(f"  Note: {len(d435s)} D435s present; using {top_serial} for top.")
+        print(f"  TOP camera (D435, by model): {top_serial}")
+    elif uvc_devs:
+        top_v4l2 = uvc_devs[0]
         if len(uvc_devs) > 1:
-            print(f"  Multiple UVC devices; using first: {uvc_devs[0]}")
-        top_dev = uvc_devs[0]
+            print(f"  Multiple UVC devices; using first: {top_v4l2}.")
+        print(f"  TOP camera (UVC fallback, no D435 found): {top_v4l2}")
+    else:
+        print("  WARNING: no D435 and no UVC webcam; top camera unset.")
 
-    # Place orange cube on LEFT, identify left D405.
-    print("\nPut the bright orange cube on the LEFT side of the workspace.")
-    print("Make sure it's clearly visible to whichever camera covers the left arm.")
-    input("Press Enter when ready...")
+    # Left/right candidates: the D405s. (If <2 D405s, fall back to any
+    # remaining RealSense so the orange test can still run.)
+    if len(d405s) >= 2:
+        wrist_candidates = d405s
+        if len(d405s) > 2:
+            print(f"  Note: {len(d405s)} D405s present; only two are wrist "
+                  f"cameras. The orange test will pick the two with the most "
+                  f"orange; any extra D405 is unused.")
+    else:
+        print(f"  WARNING: expected 2 D405 wrist cameras, found {len(d405s)}. "
+              f"Falling back to any non-top RealSense for wrist identification.")
+        wrist_candidates = [s for s in rs_serials if s != top_serial]
+        if len(wrist_candidates) < 2:
+            raise RuntimeError(
+                f"Need >=2 RealSense cameras for left/right identification; "
+                f"after assigning top={top_serial}, only {len(wrist_candidates)} "
+                f"remain."
+            )
 
-    counts = {}
-    for serial in rs_serials:
+    def _orange(serial):
         try:
-            img = grab_realsense_frame(serial)
-            n = count_orange_pixels(img)
-            counts[serial] = n
-            print(f"  {serial}: {n} bright-orange pixels")
+            return count_orange_pixels(grab_realsense_frame(serial))
         except Exception as e:
             print(f"  {serial}: capture failed: {e}")
-            counts[serial] = -1
+            return -1
 
-    if max(counts.values()) <= 0:
-        print("ERROR: no orange detected by either camera. Aborting camera ID.")
-        return {"top_cam_v4l2": top_dev, "left_cam_serial": None, "right_cam_serial": None}
+    # Test 1: cube on LEFT -- LEFT wrist cam sees the most orange.
+    print("\nPut the bright orange cube on the LEFT side of the workspace.")
+    print("Make sure it's clearly visible to the LEFT wrist camera.")
+    input("Press Enter when ready...")
+    counts_l = {s: _orange(s) for s in wrist_candidates}
+    for s, n in counts_l.items():
+        print(f"  {s}: {n} bright-orange pixels")
+    if max(counts_l.values()) <= 0:
+        print("ERROR: no orange detected by any wrist camera. Aborting camera ID.")
+        return {"left_cam_serial": None, "right_cam_serial": None,
+                "top_cam_serial": top_serial, "top_cam_v4l2": top_v4l2}
+    left_serial = max(counts_l, key=counts_l.get)
 
-    left_serial = max(counts, key=counts.get)
-    right_serial = next(s for s in rs_serials if s != left_serial)
-    print(f"\n  Identified LEFT camera (more orange) : {left_serial}")
-    print(f"  Identified RIGHT camera (less orange): {right_serial}")
+    # Test 2: cube on RIGHT (verification when only 2 wrist candidates;
+    # required disambiguation when there are extras).
+    needs_disambiguation = len(wrist_candidates) > 2
+    if needs_disambiguation:
+        print(f"\nNow put the cube on the RIGHT side. Required: {len(wrist_candidates)} "
+              f"wrist candidates -- need the right-cube test to pick which one is RIGHT.")
+        input("Press Enter when ready...")
+        ran_right = True
+    else:
+        ans = input("\nMove cube to the RIGHT side and press Enter to verify "
+                    "(or 'skip' to skip verification): ").strip().lower()
+        ran_right = not ans.startswith('s')
 
-    # Optional sanity check: cube on right.
-    ans = input("\nMove cube to the RIGHT side and press Enter to verify "
-                "(or type 'skip' to skip verification): ").strip().lower()
-    if not ans.startswith('s'):
-        counts2 = {}
-        for serial in rs_serials:
-            try:
-                img = grab_realsense_frame(serial)
-                n = count_orange_pixels(img)
-                counts2[serial] = n
-                print(f"  {serial}: {n} bright-orange pixels")
-            except Exception as e:
-                print(f"  {serial}: capture failed: {e}")
-                counts2[serial] = -1
-        if max(counts2.values()) > 0:
-            verify_right_serial = max(counts2, key=counts2.get)
-            if verify_right_serial == right_serial:
-                print(f"  Verified: {right_serial} is RIGHT (more orange on second test).")
-            else:
-                print(f"  WARNING: cube-on-right test pointed at {verify_right_serial}, "
-                      f"but first test said {right_serial} is right.")
-                print(f"  Two tests disagree; check that the cube was clearly on one side only.")
+    if ran_right:
+        counts_r = {s: _orange(s) for s in wrist_candidates}
+        for s, n in counts_r.items():
+            print(f"  {s}: {n} bright-orange pixels")
+        rest_r = {s: c for s, c in counts_r.items() if s != left_serial}
+        if not rest_r or max(rest_r.values()) <= 0:
+            if needs_disambiguation:
+                print("ERROR: no orange on right; can't disambiguate among "
+                      "extra D405s. Aborting camera ID.")
+                return {"left_cam_serial": left_serial, "right_cam_serial": None,
+                        "top_cam_serial": top_serial, "top_cam_v4l2": top_v4l2}
+            print("  No orange on right; falling back to elimination.")
+            right_serial = next(s for s in wrist_candidates if s != left_serial)
+        else:
+            right_serial = max(rest_r, key=rest_r.get)
+            if counts_r.get(left_serial, 0) > counts_r.get(right_serial, 0):
+                print(f"  WARNING: identified-left {left_serial} saw more "
+                      f"orange in the right-cube test than identified-right "
+                      f"{right_serial}. Double-check the cube placement.")
+    else:
+        right_serial = next(s for s in wrist_candidates if s != left_serial)
+
+    left_model  = rs_model_by_serial.get(left_serial,  "(unknown)")
+    right_model = rs_model_by_serial.get(right_serial, "(unknown)")
+    top_model   = rs_model_by_serial.get(top_serial,   "(unknown)") if top_serial else None
+    print(f"\n  LEFT  arm camera : {left_serial}  ({left_model})")
+    print(f"  RIGHT arm camera : {right_serial}  ({right_model})")
+    if top_serial:
+        print(f"  TOP    camera    : {top_serial}  ({top_model})")
+    elif top_v4l2:
+        print(f"  TOP    camera    : {top_v4l2}  (V4L2)")
+
+    if not _is(left_model,  "D405"): print(
+        f"  WARNING: LEFT  cam is {left_model}, expected D405 (wrist).")
+    if not _is(right_model, "D405"): print(
+        f"  WARNING: RIGHT cam is {right_model}, expected D405 (wrist).")
+    if top_serial and not _is(top_model, "D435"): print(
+        f"  WARNING: TOP   cam is {top_model}, expected D435 (context).")
 
     return {
-        "top_cam_v4l2": top_dev,
-        "left_cam_serial": left_serial,
+        "left_cam_serial":  left_serial,
         "right_cam_serial": right_serial,
+        "top_cam_serial":   top_serial,
+        "top_cam_v4l2":     top_v4l2,
     }
 
 
@@ -367,14 +442,15 @@ def main() -> int:
     print("This will identify your CAN/arm and camera mappings and save them "
           f"to:\n  {args.out}\n")
 
-    config = {}
+    old_config: dict = {}
     if CONFIG_PATH.exists():
         try:
-            config = json.loads(CONFIG_PATH.read_text())
-            print(f"Existing config found:\n  {json.dumps(config, indent=2)}")
+            old_config = json.loads(CONFIG_PATH.read_text())
+            print(f"Existing config found:\n  {json.dumps(old_config, indent=2)}")
         except Exception:
             print("Existing config exists but could not be parsed; will overwrite.")
 
+    config = dict(old_config)
     if not args.skip_arms:
         config.update(identify_arms(args.can_a, args.can_b, args.gripper))
     if not args.skip_cameras:
@@ -387,6 +463,17 @@ def main() -> int:
 
     print(f"\n=== Saved config ===\n  {out_path}\n")
     print(json.dumps(config, indent=2))
+
+    print("\n=== Diff vs previous config ===")
+    keys = sorted(set(old_config) | set(config))
+    changes = 0
+    for k in keys:
+        ov, nv = old_config.get(k, "<unset>"), config.get(k, "<unset>")
+        if ov != nv:
+            print(f"  {k}: {ov}  ->  {nv}")
+            changes += 1
+    if not changes:
+        print("  (no changes)")
     print(f"\nUse these flags in run_client.sh:")
     flags = []
     if config.get("left_can") and config.get("right_can"):

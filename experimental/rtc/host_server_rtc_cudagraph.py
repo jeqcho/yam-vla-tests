@@ -1,8 +1,18 @@
-"""MolmoAct2-BimanualYAM RTC-enabled inference server.
+"""EXPERIMENTAL: cuda-graph variant of host_server_rtc.py.
 
-Port 8203. Drop-in alternative to `scripts/host_server_yam.py` (port 8202) that
-uses Ai2's lerobot fork's MolmoAct2Policy with Real-Time Chunking (RTC) enabled.
-See ../INVESTIGATION.md for the design rationale.
+DO NOT USE FOR PRODUCTION ROLLOUTS WITHOUT VERIFICATION. The stable
+working version is host_server_rtc.py. This file applies torch.compile
+with mode='reduce-overhead' to the action expert's forward_with_context
+to produce a CUDA-graphed (and autograd-aware) code path.
+
+Why not raw torch.cuda.graph? Because RTC's denoise_step calls
+torch.autograd.grad on tensors flowing through the action expert. CUDA
+graph replay produces tensors with no grad_fn, so autograd.grad would
+fail. torch.compile(mode='reduce-overhead') captures CUDA graphs
+internally but preserves autograd semantics, so the RTC math still works.
+
+Port 8203 (same port as the stable version -- you MUST stop the stable
+server before starting this one).
 
 Wire protocol (extends host_server_yam.py with three RTC fields):
 
@@ -224,6 +234,38 @@ class RTCPolicy:
             if p.is_floating_point():
                 p.data = p.data.to(dtype)
         log.info("MolmoAct2Policy loaded in %.1fs", time.perf_counter() - t0)
+
+        # ---------- EXPERIMENTAL: torch.compile the action expert -------
+        # This is the only material change vs the stable host_server_rtc.py.
+        # torch.compile(mode="reduce-overhead") wraps forward_with_context
+        # so that on the second-and-onward call with the same input shapes,
+        # the kernel sequence is captured as a CUDA graph and replayed.
+        # Unlike raw torch.cuda.graph, the wrapped callable preserves
+        # autograd semantics (the output has a grad_fn), so RTC's
+        # autograd.grad inside denoise_step still works.
+        #
+        # First call triggers tracing + compilation (~10-30 s) and emits
+        # several inductor logs. Subsequent calls hit the graph.
+        try:
+            action_expert = self.policy._action_expert()
+            log.info("Compiling action_expert.forward_with_context with "
+                     "torch.compile(mode='reduce-overhead')...")
+            t_c = time.perf_counter()
+            action_expert.forward_with_context = torch.compile(
+                action_expert.forward_with_context,
+                mode="reduce-overhead",
+                fullgraph=False,   # safer; allows graph breaks if a Python
+                                   # op can't be traced
+                dynamic=False,     # static shapes -> better cuda-graph reuse
+            )
+            log.info("Compile wrapper installed in %.1fs (first /act will "
+                     "still pay ~10-30s tracing cost on top).",
+                     time.perf_counter() - t_c)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "torch.compile wrap failed (%s); falling back to eager. "
+                "Cuda-graph speedup will not be active.", e,
+            )
 
         # ---------- Build the pre/post processors -----------------------
         log.info("Building MolmoAct2 pre/post processor pipelines...")

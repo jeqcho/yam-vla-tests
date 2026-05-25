@@ -1,0 +1,18 @@
+
+=== motion_lag_test summary ===
+samples: 400  duration: 7.98s  target rate: 50Hz
+sinusoid: amp=0.30 rad  freq=0.50 Hz  bias=1.00 rad on joint 2
+
+per-arm tracking metrics (smaller = better):
+  arm    stall%   longest_stall   tracking_lag   jerk_rms
+  LEFT     9.8%      60.0 ms     380.0 ms  1.02e+04
+  RIGHT    9.8%      60.0 ms     300.0 ms  1.18e+04
+
+command->read latency (single-thread):
+  p50=0.01 ms  p99=544.69 ms  max=666.48 ms
+
+interpretation:
+  - stall%% > 5 or longest_stall > 100ms = PD loop visibly freezing
+  - lag should be ~ kp/kd settling, typically 20-80 ms
+  - large asymmetry between LEFT and RIGHT = per-CAN-bus issue
+  - large lat_max (>50ms) = main thread itself is being stalled

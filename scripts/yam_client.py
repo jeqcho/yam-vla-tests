@@ -128,7 +128,14 @@ def install_sdk_lock_fix() -> None:
                     _t.sleep(0)
                     self._rate_recorder.track()
                 except Exception as e:
-                    print(f"DM Error in PATCHED control loop: {e}")
+                    # close() races our control loop: it closes the CAN socket
+                    # (fd -> -1) before the loop notices self.running flipped
+                    # to False, so the in-flight send() raises. That's not an
+                    # error worth shouting about. Quiet exit when shutdown is
+                    # already underway; loud only for real mid-run failures.
+                    if not self.running:
+                        return
+                    _logging.warning(f"DM Error in PATCHED control loop: {e}")
                     self.running = False
                     raise e
 
@@ -150,16 +157,35 @@ sys.stderr.reconfigure(line_buffering=True)
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 _root = logging.getLogger()
-_root.setLevel(logging.INFO)
-_handler = logging.StreamHandler(sys.stderr)
-_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s | %(message)s"))
-_handler.setLevel(logging.INFO)
-# Avoid duplicate handlers if the module gets reloaded.
+# Root stays at WARNING so i2rt + python-can periodic INFO reports (Grav Comp
+# Control Frequency, DMChainCanInterface Total rate, PATCHED step_time
+# reports) don't spam the REPL prompt. Real errors (WARNING+) still surface.
+_root.setLevel(logging.WARNING)
+
+# i2rt or python-can calls logging.basicConfig() at import time, which adds a
+# default StreamHandler to root with the bare "INFO:root:..." format. Our
+# handler would then sit alongside it and every record would print twice.
+# Strip pre-existing handlers before installing ours.
 if not any(getattr(h, "_yam_client_handler", False) for h in _root.handlers):
+    for _h in list(_root.handlers):
+        _root.removeHandler(_h)
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s | %(message)s"))
+    _handler.setLevel(logging.INFO)
     _handler._yam_client_handler = True
     _root.addHandler(_handler)
 
+# Our own logger keeps INFO so /act diagnostics, [boundary] lines, and the
+# REPL's per-attempt status messages still show.
 log = logging.getLogger("yam.client")
+log.setLevel(logging.INFO)
+
+# Explicitly cap the chattier third-party loggers. They keep WARNING+ so
+# motor errors etc. still come through.
+for _name in ("i2rt", "can",
+              "can.interfaces.socketcan",
+              "can.interfaces.socketcan.socketcan"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 
 def trace(msg: str) -> None:
@@ -223,6 +249,35 @@ def _rr_log_inference(t_s: float, actions, executed_idx: int, rtt_ms: float,
 from datetime import datetime
 
 DEFAULT_JOURNAL_PATH = "/home/andon/yam-tests/molmoact2-setup/journal.md"
+DEFAULT_SETUP_CONFIG_PATH = "/home/andon/yam-tests/molmoact2-setup/yam_setup_config.json"
+
+
+def load_saved_config(path: str = DEFAULT_SETUP_CONFIG_PATH) -> dict:
+    """Read yam_setup_config.json if present, else return {}.
+
+    Returned dict is used as argparse defaults in main() so running
+    identify_setup.py is the only step after hardware swaps -- CLI flags
+    still override. Schema (all optional):
+      left_can, right_can   : CAN channels
+      gripper               : gripper type, applied to both arms
+      top_cam_serial        : RealSense serial for top cam (wins over
+                              top_cam_v4l2 if both set)
+      top_cam_v4l2          : V4L2 device path for a UVC top camera
+      left_cam_serial       : RealSense serial for left-arm camera
+      right_cam_serial      : RealSense serial for right-arm camera
+    """
+    import json as _json
+    try:
+        with open(path) as f:
+            cfg = _json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning("failed to read %s: %s -- using built-in defaults", path, e)
+        return {}
+    if cfg:
+        log.info("Loaded saved setup config from %s", path)
+    return cfg
 
 
 def _journal_format_duration(seconds: float) -> str:
@@ -441,19 +496,42 @@ class RealSenseStream(CameraStream):
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
         self.pipeline = rs.pipeline()
         self.pipeline.start(cfg)
-        # D405 sometimes takes >1s to produce its first frame after start().
-        # Drop a few warmup frames with a generous timeout so the first real
-        # grab() doesn't time out (cf. scripts/capture_frames.py).
-        for _ in range(5):
+        # Wait until we've actually received some warmup frames, not just
+        # spent a fixed number of timeouts pretending to. D405s usually
+        # produce a first frame within ~1 s; a D435 on USB 2.0 has been
+        # observed to take 10+ s -- if we bail too early start() returns
+        # "successfully" but the next grab() raises.
+        budget_s = 20.0
+        target_frames = 3
+        deadline = time.monotonic() + budget_s
+        got = 0
+        while got < target_frames and time.monotonic() < deadline:
             try:
                 self.pipeline.wait_for_frames(timeout_ms=2000)
+                got += 1
             except Exception:
                 pass
-        log.info("camera %s (RealSense %s) started @ %dx%d/%d Hz", self.name, self.serial,
-                 self.width, self.height, self.fps)
+        if got == 0:
+            raise RuntimeError(
+                f"camera {self.name} (RealSense {self.serial}) produced no "
+                f"frames within {budget_s:.0f}s of pipeline start -- check "
+                f"USB port (D435 needs USB 3) and cable."
+            )
+        log.info("camera %s (RealSense %s) started @ %dx%d/%d Hz "
+                 "(warmup %d frames)",
+                 self.name, self.serial, self.width, self.height, self.fps, got)
 
     def grab(self) -> np.ndarray:
-        frames = self.pipeline.wait_for_frames(timeout_ms=2000)
+        # One retry on a transient "Frame didn't arrive within 2000" -- those
+        # have been observed right after USB re-enumeration. A second waiter
+        # almost always succeeds. The retry uses the same pipeline; if it's
+        # genuinely stuck, the second attempt will time out too and we raise.
+        try:
+            frames = self.pipeline.wait_for_frames(timeout_ms=2000)
+        except RuntimeError:
+            log.warning("camera %s (%s): grab timeout, retrying once",
+                        self.name, self.serial)
+            frames = self.pipeline.wait_for_frames(timeout_ms=3000)
         color = frames.get_color_frame()
         if not color:
             raise RuntimeError(f"camera {self.name} ({self.serial}) produced no color frame")
@@ -461,7 +539,13 @@ class RealSenseStream(CameraStream):
 
     def stop(self) -> None:
         if self.pipeline is not None:
-            self.pipeline.stop()
+            try:
+                self.pipeline.stop()
+            except RuntimeError as e:
+                # "stop() cannot be called before start()" means the pipeline
+                # never streamed (probably a failed start). Not worth raising
+                # during teardown.
+                log.warning("camera %s stop noop: %s", self.name, e)
 
 
 class V4L2Stream(CameraStream):
@@ -500,12 +584,20 @@ class V4L2Stream(CameraStream):
 
 def make_camera(name: str, serial: Optional[str], v4l2_device: Optional[str],
                 width: int, height: int, fps: int) -> CameraStream:
-    """Build the right camera backend based on which CLI flag was set."""
-    if serial and v4l2_device:
-        raise ValueError(f"{name}: pass exactly one of --{name}-cam-serial / --{name}-cam-v4l2")
+    """Build the right camera backend.
+
+    If both serial and v4l2_device are set, serial wins -- this lets a CLI
+    `--<slot>-cam-serial X` override a `top_cam_v4l2` left in the saved
+    setup config from a previous hardware generation without having to
+    explicitly clear the v4l2 entry. Re-run identify_setup.py to clean up.
+    """
     if not serial and not v4l2_device:
         raise ValueError(f"{name}: must pass --{name}-cam-serial or --{name}-cam-v4l2")
     if serial:
+        if v4l2_device:
+            log.warning("%s: both --%s-cam-serial and --%s-cam-v4l2 set; "
+                        "using serial. Re-run identify_setup.py to update config.",
+                        name, name, name)
         return RealSenseStream(serial, name, width=width, height=height, fps=fps)
     return V4L2Stream(v4l2_device, name, width=width, height=height, fps=fps)
 
@@ -685,22 +777,35 @@ def main() -> None:
     journal_start_s = time.time()
     journal_invocation = _journal_invocation()
 
+    # Defaults are sourced from yam_setup_config.json (populated by
+    # identify_setup.py) so that after a hardware swap, re-running
+    # identify_setup.py is the only step needed -- no script edits.
+    _cfg = load_saved_config()
+    _gripper_default = _cfg.get("gripper", "linear_4310")
     p = argparse.ArgumentParser(description="MolmoAct2-BimanualYAM client")
-    p.add_argument("--left-can", default="can0", help="CAN channel for the LEFT arm")
-    p.add_argument("--right-can", default="can1", help="CAN channel for the RIGHT arm")
-    p.add_argument("--left-gripper", default="linear_4310",
+    p.add_argument("--left-can",  default=_cfg.get("left_can",  "can0"),
+                   help="CAN channel for the LEFT arm")
+    p.add_argument("--right-can", default=_cfg.get("right_can", "can1"),
+                   help="CAN channel for the RIGHT arm")
+    p.add_argument("--left-gripper",  default=_gripper_default,
                    choices=["crank_4310", "linear_3507", "linear_4310", "flexible_4310"],
                    help="Gripper type on the left arm")
-    p.add_argument("--right-gripper", default="linear_4310",
+    p.add_argument("--right-gripper", default=_gripper_default,
                    choices=["crank_4310", "linear_3507", "linear_4310", "flexible_4310"],
                    help="Gripper type on the right arm")
     # Per-camera: pass exactly one of --<slot>-cam-serial (RealSense) or --<slot>-cam-v4l2 (UVC webcam, e.g. /dev/video0)
-    p.add_argument("--top-cam-serial",   default=None, help="RealSense serial for overhead (top) camera")
-    p.add_argument("--top-cam-v4l2",     default=None, help="V4L2 device path for overhead (top) camera, e.g. /dev/video0")
-    p.add_argument("--left-cam-serial",  default=None, help="RealSense serial for left-arm camera")
-    p.add_argument("--left-cam-v4l2",    default=None, help="V4L2 device path for left-arm camera")
-    p.add_argument("--right-cam-serial", default=None, help="RealSense serial for right-arm camera")
-    p.add_argument("--right-cam-v4l2",   default=None, help="V4L2 device path for right-arm camera")
+    p.add_argument("--top-cam-serial",   default=_cfg.get("top_cam_serial"),
+                   help="RealSense serial for overhead (top) camera")
+    p.add_argument("--top-cam-v4l2",     default=_cfg.get("top_cam_v4l2"),
+                   help="V4L2 device path for overhead (top) camera, e.g. /dev/video0")
+    p.add_argument("--left-cam-serial",  default=_cfg.get("left_cam_serial"),
+                   help="RealSense serial for left-arm camera")
+    p.add_argument("--left-cam-v4l2",    default=_cfg.get("left_cam_v4l2"),
+                   help="V4L2 device path for left-arm camera")
+    p.add_argument("--right-cam-serial", default=_cfg.get("right_cam_serial"),
+                   help="RealSense serial for right-arm camera")
+    p.add_argument("--right-cam-v4l2",   default=_cfg.get("right_cam_v4l2"),
+                   help="V4L2 device path for right-arm camera")
     # Bandwidth-tunable camera config. Defaults sized for two D405s on USB 2.0
     # (~9.2 MB/s each at 424x240 RGB8 / 30 fps -- 18.4 MB/s total, fits the
     # ~40 MB/s practical ceiling of USB 2.0 with headroom for CAN + webcam).
@@ -859,9 +964,13 @@ def main() -> None:
             trace(f"camera {c.name} started")
         # Settle: grab a couple of frames so the auto-exposure has converged
         # and the pipelines are fully past their startup transients before
-        # we let the motor control thread come online.
+        # we let the motor control thread come online. Tolerant of misses:
+        # start() already proved each cam can produce frames; the control
+        # loop grabs have their own timeout/retry.
         for _ in range(3):
-            top.grab(); cam_l.grab(); cam_r.grab()
+            for c in (top, cam_l, cam_r):
+                try: c.grab()
+                except Exception as e: log.warning("settle: %s.grab() failed: %s", c.name, e)
         trace("cameras streaming, USB quiet -- safe to init arms")
     except Exception:
         # If camera setup failed, close anything we partially opened then
