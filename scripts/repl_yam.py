@@ -77,6 +77,100 @@ import yam_backends  # noqa: E402  -- our backends
 
 
 # ---------------------------------------------------------------------------
+# Helpers: journal-based instruction recall + interactive knob tuning
+# ---------------------------------------------------------------------------
+
+def _last_instruction_from_journal(path: str) -> Optional[str]:
+    """Return the most-recent **Instruction** value in the journal, or None.
+
+    Lets the REPL pre-fill the instruction prompt with the last thing run
+    in any past session -- so re-running the same task on a new day is
+    just press-enter at the prompt.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (FileNotFoundError, OSError):
+        return None
+    import re
+    matches = re.findall(r"\*\*Instruction\*\*:\s*'(.+?)'", text)
+    return matches[-1] if matches else None
+
+
+# The runtime knobs an operator might want to tune mid-session. Each entry:
+# (args attr name, parser/'bool', one-line description). The parser is
+# applied to the new value string before setattr.
+_TUNABLE_KNOBS = [
+    ("horizon_stride",  int,   "steps of each action chunk to play before re-query"),
+    ("max_step_rad",    float, "per-tick joint cap (rad). 0 = disabled"),
+    ("gripper_step",    float, "per-tick gripper cap (normalized). 0 = disabled"),
+    ("train_fps",       float, "inner-loop tick rate (Hz)"),
+    ("num_steps",       int,   "flow-matching steps (molmoact2 only)"),
+    ("timeout_s",       float, "per-/act HTTP/WS/ZMQ timeout (s)"),
+    ("ramp_duration_s", float, "ramp duration for ready/reset/return (s)"),
+    ("dry_run",         "bool","True = print actions, do NOT command arms"),
+]
+
+
+def prompt_tune_knobs(args) -> None:
+    """Show the current runtime knobs; let the operator edit any of them
+    in place before this attempt. Mutates `args` so the new values:
+
+      - apply IMMEDIATELY to the about-to-run attempt (the inner loop
+        reads args.horizon_stride etc. at every iteration);
+      - PERSIST to subsequent attempts in the same session;
+      - get RECORDED in the journal (Configuration block dumps args).
+
+    Press enter at the menu to skip and continue. 'q' to skip THIS
+    instruction. Ctrl-C bubbles up like elsewhere in the REPL.
+    """
+    while True:
+        print("", flush=True)
+        print("tunable knobs  (num to edit, enter to continue, 'q' to skip this instruction):",
+              flush=True)
+        for i, (name, _parser, desc) in enumerate(_TUNABLE_KNOBS, 1):
+            val = getattr(args, name)
+            print(f"  {i}. {name:<18} = {val!r:<10}   {desc}", flush=True)
+        sys.stdout.flush()
+        try:
+            choice = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not choice:
+            return
+        if choice in ("q", "quit", "skip"):
+            raise _SkipInstruction()
+        try:
+            idx = int(choice) - 1
+            name, parser, _desc = _TUNABLE_KNOBS[idx]
+        except (ValueError, IndexError):
+            print(f"  ?? unknown {choice!r}; enter 1-{len(_TUNABLE_KNOBS)} "
+                  f"or blank to continue", flush=True)
+            continue
+        current = getattr(args, name)
+        try:
+            new_raw = input(f"  new {name} (curr {current!r}, blank=keep): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not new_raw:
+            continue
+        try:
+            if parser == "bool":
+                new_val = new_raw.lower() in ("1", "true", "t", "yes", "y", "on")
+            else:
+                new_val = parser(new_raw)
+        except ValueError as e:
+            print(f"  invalid {name}: {e}", flush=True)
+            continue
+        setattr(args, name, new_val)
+        print(f"  -> {name} = {new_val!r}", flush=True)
+
+
+class _SkipInstruction(Exception):
+    """Internal sentinel: operator typed 'q' in the knob-tune menu."""
+
+
+# ---------------------------------------------------------------------------
 # Per-policy argparse defaults
 # ---------------------------------------------------------------------------
 
@@ -192,6 +286,23 @@ def main() -> None:
     # Rerun (optional).
     rerun_requested = args.rerun or (args.rerun_save is not None)
     if rerun_requested:
+        # AUTO-SAVE: if --rerun was passed but no --rerun-save path was
+        # specified, default to writing the .rrd to eval-yam/logs/rrd/.
+        # Cost: ~50-200 MB per session (depends on duration + image size).
+        # Benefit: every session leaves a full per-tick replay on disk
+        # that can be re-opened in Rerun later or read programmatically
+        # via `rerun.dataframe.load_recording(path).view(...)` for
+        # offline analysis (joint trajectories, action/state divergence,
+        # etc). Without this, joint histories die with the viewer.
+        if args.rerun and not args.rerun_save:
+            from datetime import datetime as _dt
+            rrd_dir = os.path.join(os.path.dirname(_HERE), "logs", "rrd")
+            os.makedirs(rrd_dir, exist_ok=True)
+            args.rerun_save = os.path.join(
+                rrd_dir,
+                f"{_dt.now().strftime('%Y-%m-%d_%H%M%S')}_{args.policy}.rrd",
+            )
+            log.info("AUTO-SAVING Rerun recording to %s", args.rerun_save)
         try:
             import rerun as rr
             yc._rr = rr
@@ -212,6 +323,22 @@ def main() -> None:
     except Exception as e:
         log.error("[%s] server health check failed: %s", args.policy, e)
         sys.exit(2)
+
+    # Stash the server's self-reported identity onto args so the journal's
+    # _journal_format_args() dumps it into every attempt's Configuration
+    # block. Critical when multiple checkpoints can be served at the same
+    # port over the lifetime of a project (gr00t base vs YAM finetune vs
+    # future finetunes; pi05 yam_pi05 vs other configs). Without this,
+    # CSV rows recorded today are indistinguishable from CSV rows recorded
+    # against a different checkpoint of the same policy class.
+    #   - molmoact2 server returns repo_id / dtype / norm_tag / num_cameras
+    #   - gr00t PolicyServer ping returns only {status, message}; capture
+    #     transport at minimum
+    #   - pi05 openpi metadata may include policy.config / policy.dir
+    args.server_repo_id  = meta.get("repo_id",  "unknown")
+    args.server_dtype    = meta.get("dtype",    "unknown")
+    args.server_norm_tag = meta.get("norm_tag", "unknown")
+    args.server_meta     = repr(meta)
 
     # Cameras before arms (USB-storm-vs-CAN ordering).
     top = cam_l = cam_r = None
@@ -274,12 +401,19 @@ def main() -> None:
         log.error("Server warmup failed: %s. Continuing anyway.", e)
 
     loop_t0 = time.perf_counter()
-    last_instruction: Optional[str] = None
+    # Pre-load the most-recent instruction across ALL past sessions so the
+    # first prompt at REPL launch is "press enter to reuse last: '...'".
+    # Convenient for re-running yesterday's task without retyping.
+    last_instruction: Optional[str] = _last_instruction_from_journal(args.journal_path)
+    if last_instruction:
+        log.info("Pre-loaded last instruction from %s: %r",
+                 args.journal_path, last_instruction)
     attempt_idx = 0
 
     print("\n" + "=" * 70, flush=True)
     print(f"YAM REPL  |  policy={args.policy}", flush=True)
-    print("  - type an instruction and press enter", flush=True)
+    print("  - type an instruction (or press enter to reuse last)", flush=True)
+    print("  - then the knob-tuning menu appears -- num to edit, enter to start", flush=True)
     print("  - press enter again to stop the attempt and reset", flush=True)
     print("  - 's' at the outcome prompt skips the journal", flush=True)
     print("  - 'quit' (or ctrl-c) at the instruction prompt to exit", flush=True)
@@ -291,6 +425,18 @@ def main() -> None:
             if instruction is None:
                 break
             last_instruction = instruction
+
+            # Knob-tuning menu: lets the operator edit per-tick caps,
+            # stride, etc. before EACH attempt. Mutations persist across
+            # attempts in this session and are recorded in the journal's
+            # Configuration block automatically.
+            try:
+                prompt_tune_knobs(args)
+            except _SkipInstruction:
+                log.info("skipped instruction at knob-tune menu; back to prompt")
+                continue
+            except (EOFError, KeyboardInterrupt):
+                break
 
             try:
                 if not confirm_ready(instruction):
