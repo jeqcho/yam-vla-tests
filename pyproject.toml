@@ -3,8 +3,13 @@ name = "yam-vla"
 version = "0.1.0"
 description = "Unified testing grounds for VLAs on the bimanual YAM rig"
 requires-python = ">=3.10"
+# Core client deps shared by every policy backend. NUMPY is pinned to
+# <2.0 here because openpi-client requires it; i2rt's pyproject claims
+# to pin numpy==2.2.6, but runtime works fine on 1.x (verified against
+# the legacy i2rt venv). The mismatch is resolved declaratively in
+# [tool.uv].override-dependencies below.
 dependencies = [
-    "numpy>=1.26",
+    "numpy>=1.26,<2.0",
     "pyyaml>=6.0",
     "requests>=2.31",
     "json-numpy>=2.1.0",
@@ -12,12 +17,20 @@ dependencies = [
     "msgpack-numpy>=0.4.8",
     "pyzmq>=25.0",
     "websockets>=12.0",
-    "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client",
 ]
 
 [project.optional-dependencies]
+# `hardware`: everything needed to drive real cameras + real arms. The
+# i2rt dep is resolved to a local path via [tool.uv.sources].
 hardware = [
     "pyrealsense2>=2.55",
+    "i2rt",
+]
+# `pi05`: the openpi WebSocket client. Only required for `--policy pi05`
+# evals. Moved out of core to keep the numpy<2.0 override from looking
+# magic to anyone reading the main dep list.
+pi05 = [
+    "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client",
 ]
 viz = [
     "rerun-sdk>=0.20",
@@ -33,8 +46,24 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/yam_vla"]
 
+# Required because `openpi-client` is pulled from a git URL (a "direct
+# reference"). Without this opt-in, hatchling refuses to build the
+# editable wheel during `uv sync`.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+# Map the `i2rt` package name to the sibling working tree. Editable so
+# changes to i2rt's source apply without reinstalling.
+[tool.uv.sources]
+i2rt = { path = "/home/andon/yam-tests/i2rt", editable = true }
+
 [tool.uv]
 package = true
+# Force numpy < 2.0 globally. i2rt's pyproject claims to need
+# numpy==2.2.6 but runs fine on 1.26.4 (legacy venv has been running
+# this combo for months). Overriding here lets i2rt + openpi-client
+# coexist in one venv, which they can't under their declared specs.
+override-dependencies = ["numpy<2.0"]
 
 [tool.ruff]
 line-length = 100
