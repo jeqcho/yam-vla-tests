@@ -15,8 +15,10 @@ fi
 INVOCATION_ARGS=$(printf ' %q' "$@")
 export YAM_INVOCATION="${BASH_SOURCE[0]}${INVOCATION_ARGS}"
 
+# Policy-specific stride default; see run_repl_gr00t-n17.sh for rationale.
 exec "$PYTHON" "$EVAL_DIR/eval_yam_tasks.py" \
     --policy gr00t-n17 \
     --server-host "${YAM_SERVER_HOST:-127.0.0.1}" \
     --server-port "${YAM_SERVER_PORT:-5556}" \
+    --horizon-stride "${YAM_HORIZON_STRIDE:-4}" \
     "$@"

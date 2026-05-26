@@ -402,6 +402,15 @@ def main() -> None:
         log.error("[%s] server health check failed: %s", args.policy, e)
         sys.exit(2)
 
+    # Stash server identity onto args so the journal's _journal_format_args
+    # records it in every attempt's Configuration block. See repl_yam.py
+    # for the rationale -- short version: "policy: gr00t-n17" alone isn't
+    # enough provenance once you have >1 gr00t finetune at the same port.
+    args.server_repo_id  = meta.get("repo_id",  "unknown")
+    args.server_dtype    = meta.get("dtype",    "unknown")
+    args.server_norm_tag = meta.get("norm_tag", "unknown")
+    args.server_meta     = repr(meta)
+
     # Cameras before arms.
     top = cam_l = cam_r = None
     left = right = None

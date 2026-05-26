@@ -19,8 +19,15 @@ fi
 INVOCATION_ARGS=$(printf ' %q' "$@")
 export YAM_INVOCATION="${BASH_SOURCE[0]}${INVOCATION_ARGS}"
 
+# Policy-specific stride default (=16% of pi05's 50-step chunk =
+# ~267 ms open-loop window at 30 Hz). pi05 has the longest horizon of
+# the three policies, so a smaller % stride still gives a longer
+# absolute motion window. User-passed --horizon-stride wins via
+# argparse last-occurrence-wins. Env override:
+#   YAM_HORIZON_STRIDE=12 ./run_repl_pi05.sh
 exec "$PYTHON" "$EVAL_YAM_DIR/scripts/repl_yam.py" \
     --policy pi05 \
     --server-host "${YAM_SERVER_HOST:-127.0.0.1}" \
     --server-port "${YAM_SERVER_PORT:-8000}" \
+    --horizon-stride "${YAM_HORIZON_STRIDE:-8}" \
     "$@"

@@ -15,7 +15,9 @@ fi
 INVOCATION_ARGS=$(printf ' %q' "$@")
 export YAM_INVOCATION="${BASH_SOURCE[0]}${INVOCATION_ARGS}"
 
+# Policy-specific stride default; see run_repl_molmoact2.sh for rationale.
 exec "$PYTHON" "$EVAL_DIR/eval_yam_tasks.py" \
     --policy molmoact2 \
     --server-url "${YAM_SERVER_URL:-http://127.0.0.1:8202/act}" \
+    --horizon-stride "${YAM_HORIZON_STRIDE:-6}" \
     "$@"

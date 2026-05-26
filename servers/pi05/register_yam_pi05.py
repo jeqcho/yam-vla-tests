@@ -91,9 +91,15 @@ def register() -> None:
                 assets_dir=None,
                 asset_id="jeqcho/yam-bimanual-merged-v2-train",
             ),
-            # YAM is NOT Trossen Aloha hardware -- disable the
-            # joint-flip / gripper-radian conversion that
-            # AlohaInputs/Outputs apply for the actual Aloha rig.
+            # adapt_to_pi: MUST match the training fork.
+            # - False (correct): YAM joint angles passed through as-is.
+            # - True  (wrong here): _joint_flip_mask sign-flips joints
+            #   [1,2] of each arm on input AND output, mangling the
+            #   model's view of state. Tested empirically: with True,
+            #   arms immediately retracted to rest pose (model saw
+            #   garbage state and planned a "safe" recovery). Reverted.
+            #
+            # Training fork's actual setting was False.
             adapt_to_pi=False,
             # use_delta_joint_actions: MUST match the training fork's
             # setting. If they differ, the openpi server's AbsoluteActions
