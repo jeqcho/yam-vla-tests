@@ -39,4 +39,34 @@ options:
 # Used by the eval/REPL harnesses to set sensible defaults for the control loop.
 control:
   action_horizon_hint: 30  # number of (14,) action rows per chunk
-  horizon_stride_default: 6
+  # horizon_stride_default = actions played per chunk before re-querying.
+  # We respect the upstream convention: stride = action_horizon, i.e.
+  # play the entire 30-row chunk before triggering the next inference.
+  # That matches what norm_stats.json declares
+  # (action_horizon = n_action_steps = 30) and what the model was
+  # trained to execute as a coherent plan -- the LeRobot diffusion-
+  # policy convention π₀, GR00T-N1.7, and MolmoAct2 all inherit.
+  # At 30 Hz this is ~1 s of open-loop motion per inference, which
+  # makes the loop firmly playback-bound regardless of RTT.
+  # Override via --horizon-stride if you want an MPC-style receding-
+  # horizon loop (e.g. stride < 30 for contact-rich / dynamic tasks).
+  horizon_stride_default: 30
+
+  # 14-D "ready pose" the harness ramps to before each rollout AND
+  # between attempts. Derived from action_stats.mean in norm_stats.json
+  # (the centroid of training-action distribution) with the LEFT/RIGHT
+  # arms forced into exact bilateral symmetry: per-joint magnitudes
+  # averaged, signs preserved per the original mirror structure
+  # (joints 1, 5, 6 are sign-flipped). Recomputed at policy-update time
+  # via `yam_vla.core.hardware.load_canonical_ready_pose(
+  #     <hf-cache>/norm_stats.json, "yam_dual_molmoact2",
+  #     decimals=2, mirror_symmetrize=True)`.
+  # The harness preserves whatever gripper opening is current at
+  # indices 6 and 13 -- the gripper values below are placeholders that
+  # get overwritten with each arm's startup pose immediately before
+  # the ramp, so we don't slam-close on whatever is held.
+  #
+  #               j1     j2    j3    j4    j5     j6    grip
+  ready_pose: [-0.10,  1.36, 1.18, -0.70,  0.16, -0.22, 0.62,   # left arm
+                0.10,  1.36, 1.18, -0.70, -0.16,  0.22, 0.62]   # right arm
+  ready_pose_ramp_duration_s: 5.0

@@ -57,4 +57,9 @@ embodiment_tag: NEW_EMBODIMENT   # enum NAME; value "new_embodiment"
 
 control:
   action_horizon_hint: 16   # INFERENCE output positions, not training-time 40
-  horizon_stride_default: 4
+  # Match the upstream NVIDIA convention: play the full inference chunk
+  # (16 rows) before re-querying. NVIDIA's reference run_gr00t_server
+  # deployment plays all 16, so stride=16 here is "as trained / as
+  # released." At 30 Hz this is ~530 ms of open-loop motion per call.
+  # Override via --horizon-stride for an MPC-style closed-loop variant.
+  horizon_stride_default: 16

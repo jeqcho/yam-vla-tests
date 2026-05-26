@@ -55,4 +55,11 @@ training_config:
 
 control:
   action_horizon_hint: 16   # real trained horizon; wire returns padded 50
-  horizon_stride_default: 8
+  # Match the upstream openpi convention: play the full real trained
+  # horizon (16 rows) before re-querying. The wire returns 50 rows,
+  # but positions 16-49 are extrapolation past the trained horizon and
+  # MUST NOT be played -- so the upstream slice point AND our stride
+  # are both 16. At 30 Hz that's ~530 ms of open-loop motion per call.
+  # Override via --horizon-stride for an MPC-style closed-loop variant.
+  # NEVER set --horizon-stride > 16 -- that plays extrapolated rows.
+  horizon_stride_default: 16
