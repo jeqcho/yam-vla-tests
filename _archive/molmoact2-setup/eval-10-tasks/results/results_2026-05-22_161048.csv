@@ -1,0 +1,2 @@
+timestamp,task_num,task_name,attempt,status,duration_s,n_chunks,mean_rtt_ms,max_rtt_ms,mean_horizon_span,max_state_vs_a0,clip_pct,notes
+2026-05-22 16:13:31,1,Stack two orange blocks vertically,1,failure,136.9,337,204,598,0.307,0.235,2.2,

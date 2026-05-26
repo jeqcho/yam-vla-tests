@@ -1,0 +1,791 @@
+"""EXPERIMENTAL: cuda-graph variant of host_server_rtc.py.
+
+DO NOT USE FOR PRODUCTION ROLLOUTS WITHOUT VERIFICATION. The stable
+working version is host_server_rtc.py. This file applies torch.compile
+with mode='reduce-overhead' to the action expert's forward_with_context
+to produce a CUDA-graphed (and autograd-aware) code path.
+
+Why not raw torch.cuda.graph? Because RTC's denoise_step calls
+torch.autograd.grad on tensors flowing through the action expert. CUDA
+graph replay produces tensors with no grad_fn, so autograd.grad would
+fail. torch.compile(mode='reduce-overhead') captures CUDA graphs
+internally but preserves autograd semantics, so the RTC math still works.
+
+Port 8203 (same port as the stable version -- you MUST stop the stable
+server before starting this one).
+
+Wire protocol (extends host_server_yam.py with three RTC fields):
+
+    GET  /act        -> health check
+    POST /act        -> action inference
+        request body  (json_numpy):
+            {
+              "top_cam":     ndarray(H, W, 3) uint8 RGB,
+              "left_cam":    ndarray(H, W, 3) uint8 RGB,
+              "right_cam":   ndarray(H, W, 3) uint8 RGB,
+              "instruction": str,
+              "state":       ndarray(14,) float32,
+              "num_steps":   int   (optional, default 10),
+              # RTC-specific (all optional; if absent we behave like non-RTC):
+              "prev_chunk_left_over": ndarray(L, 14) float32 (optional),
+              "inference_delay":      int   (optional, default 0),
+              "execution_horizon":    int   (optional, default 10),
+              "timestamp":   float  (optional, ignored),
+            }
+        response body (json_numpy):
+            {"actions": ndarray(N, 14) float32, "dt_ms": float, "rtc": {...}}
+
+Setup (assumes the existing molmoact2-setup .venv has torch + transformers
+already installed; we add lerobot from Ai2's fork):
+
+    VIRTUAL_ENV=/home/andon/yam-tests/molmoact2-setup/.venv \\
+      uv pip install \\
+        "lerobot @ git+https://github.com/allenai/lerobot.git@molmoact2-policy"
+
+Run:
+
+    /home/andon/yam-tests/molmoact2-setup/.venv/bin/python \\
+        experimental/rtc/host_server_rtc.py --port 8203
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import threading
+import time
+from typing import Any
+
+import json_numpy
+import numpy as np
+import torch
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from PIL import Image
+
+# NOTE: do NOT call json_numpy.patch() here. Globally patching stdlib json
+# breaks numpy.testing's import (which uses json.loads with its own
+# object_hook returning SimpleNamespace). json_numpy chains its hook around
+# the caller's, causing 'argument of type SimpleNamespace is not iterable'
+# when its hook then runs `"__numpy__" in dct`. Our FastAPI handlers use
+# json_numpy.loads/dumps explicitly, so the global patch is unnecessary.
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("molmoact2.yam.rtc.server")
+
+
+# ---------------------------------------------------------------------------
+# Constants for the BimanualYAM checkpoint.
+# Mirrors what's in scripts/host_server_yam.py + what we read out of
+# norm_stats.json: camera_keys / state_key / action_key / setup_type /
+# control_mode all come from there. The lerobot config wants them spelled
+# out as Python values; we copy them verbatim from the checkpoint metadata.
+# ---------------------------------------------------------------------------
+REPO_ID = "allenai/MolmoAct2-BimanualYAM"
+NORM_TAG = "yam_dual_molmoact2"
+STATE_DIM = 14
+ACTION_DIM = 14
+NUM_CAMERAS = 3
+DEFAULT_NUM_STEPS = 10
+
+# Came from norm_stats.json[metadata_by_tag][yam_dual_molmoact2]:
+SETUP_TYPE = "bimanual yam robotic arms in molmoact2"
+CONTROL_MODE = "absolute joint pose"
+CAMERA_KEYS = [
+    "observation.images.top",
+    "observation.images.left",
+    "observation.images.right",
+]
+STATE_KEY = "observation.state"
+ACTION_KEY = "action"
+CHUNK_SIZE = 30  # action_horizon from checkpoint
+
+
+def _to_pil(arr: Any) -> Image.Image:
+    if isinstance(arr, Image.Image):
+        return arr.convert("RGB")
+    a = np.asarray(arr)
+    if a.ndim != 3 or a.shape[2] != 3:
+        raise ValueError(f"image must be HxWx3, got shape {a.shape}")
+    if a.dtype != np.uint8:
+        a = np.clip(a, 0, 255).astype(np.uint8)
+    return Image.fromarray(a, mode="RGB")
+
+
+class RTCPolicy:
+    """Wraps lerobot's MolmoAct2Policy with RTC enabled and exposes a single
+    `predict(...)` that takes raw images + state + leftover and returns the
+    14-D unnormalized action chunk.
+
+    Builds the policy + processors once at startup. predict() is called under
+    a coarse lock because the action expert isn't safe under concurrent calls
+    (same constraint as the HF server; RTC sampling doesn't change this).
+    """
+
+    def __init__(
+        self,
+        repo_id: str,
+        device: str,
+        dtype: torch.dtype,
+        rtc_execution_horizon: int = 10,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_attention_schedule: str = "exp",
+    ) -> None:
+        # Import lerobot here so a missing install fails with a clear message
+        # AT startup rather than at import-time of this module.
+        try:
+            from lerobot.configs.types import FeatureType, PolicyFeature
+            from lerobot.policies.molmoact2.configuration_molmoact2 import (
+                MolmoAct2Config,
+            )
+            from lerobot.policies.molmoact2.modeling_molmoact2 import (
+                MolmoAct2Policy,
+            )
+            from lerobot.policies.molmoact2.processor_molmoact2 import (
+                make_molmoact2_pre_post_processors,
+            )
+            from lerobot.policies.rtc.configuration_rtc import (
+                RTCAttentionSchedule,
+                RTCConfig,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                "lerobot import failed. Install Ai2's fork into the server venv:\n"
+                "  VIRTUAL_ENV=/home/andon/yam-tests/molmoact2-setup/.venv "
+                "uv pip install 'lerobot @ "
+                "git+https://github.com/allenai/lerobot.git@molmoact2-policy'\n"
+                f"Original error: {e}"
+            ) from e
+
+        # ---------- Build the RTCConfig --------------------------------
+        # All four schedules from RTCAttentionSchedule. The paper's Eq. 5 is
+        # the EXP variant (c_i*(e^c_i - 1)/(e - 1)); LINEAR is a simpler
+        # alternative lerobot also exposes. ZEROS/ONES are diagnostic
+        # (no fade region, all-hard or all-anchored).
+        schedule_map = {
+            "linear": RTCAttentionSchedule.LINEAR,
+            "exp":    RTCAttentionSchedule.EXP,
+            "zeros":  RTCAttentionSchedule.ZEROS,
+            "ones":   RTCAttentionSchedule.ONES,
+        }
+        if rtc_attention_schedule not in schedule_map:
+            raise ValueError(
+                f"unknown rtc_attention_schedule={rtc_attention_schedule!r}; "
+                f"known: {list(schedule_map)}"
+            )
+        self.rtc_config = RTCConfig(
+            enabled=True,
+            prefix_attention_schedule=schedule_map[rtc_attention_schedule],
+            max_guidance_weight=rtc_max_guidance_weight,
+            execution_horizon=rtc_execution_horizon,
+        )
+        log.info(
+            "RTCConfig: enabled=True, schedule=%s, exec_horizon=%d, max_guidance=%.1f",
+            rtc_attention_schedule, rtc_execution_horizon, rtc_max_guidance_weight,
+        )
+
+        # ---------- Build the MolmoAct2Config --------------------------
+        # Most of these mirror what norm_stats.json says about the YAM
+        # checkpoint (norm_tag yam_dual_molmoact2). When in doubt, keep
+        # lerobot defaults — the policy class itself overrides them from
+        # the HF checkpoint when it loads.
+        # output_features must include the action feature with a positive
+        # shape, otherwise _output_action_dim() raises.
+        # input_features should ONLY include the state -- if image features
+        # are present here, the normalizer iterates over them and calls
+        # torch.as_tensor(PIL.Image), which fails with "Could not infer dtype
+        # of Image". Image handling is done separately by the MolmoAct2
+        # PackInputs processor step (which reads config.image_keys directly).
+        action_feature = PolicyFeature(type=FeatureType.ACTION, shape=(ACTION_DIM,))
+        state_feature = PolicyFeature(type=FeatureType.STATE,  shape=(STATE_DIM,))
+        self.config = MolmoAct2Config(
+            checkpoint_path=repo_id,
+            norm_tag=NORM_TAG,
+            image_keys=CAMERA_KEYS,
+            setup_type=SETUP_TYPE,
+            control_mode=CONTROL_MODE,
+            chunk_size=CHUNK_SIZE,
+            n_action_steps=CHUNK_SIZE,
+            rtc_config=self.rtc_config,
+            inference_action_mode="continuous",
+            input_features={STATE_KEY: state_feature},
+            output_features={ACTION_KEY: action_feature},
+        )
+        log.info(
+            "MolmoAct2Config: repo=%s, norm_tag=%s, image_keys=%s",
+            repo_id, NORM_TAG, CAMERA_KEYS,
+        )
+
+        # ---------- Build the policy ------------------------------------
+        log.info("Loading MolmoAct2Policy (this can take ~30s on first run)...")
+        t0 = time.perf_counter()
+        # MolmoAct2Policy.__init__ delegates to AutoModelForImageTextToText
+        # internally; trust_remote_code is set in the config (default True).
+        self.policy = MolmoAct2Policy(self.config)
+        self.policy = self.policy.to(device).eval()
+        # Cast floating-point parameters to the requested dtype (bf16).
+        # We avoid `.to(dtype)` on the whole policy because non-fp buffers
+        # (token IDs etc.) shouldn't be touched. The action expert + VLM
+        # backbone are what we want in bf16.
+        for p in self.policy.parameters():
+            if p.is_floating_point():
+                p.data = p.data.to(dtype)
+        log.info("MolmoAct2Policy loaded in %.1fs", time.perf_counter() - t0)
+
+        # ---------- EXPERIMENTAL: torch.compile the action expert -------
+        # This is the only material change vs the stable host_server_rtc.py.
+        # torch.compile(mode="reduce-overhead") wraps forward_with_context
+        # so that on the second-and-onward call with the same input shapes,
+        # the kernel sequence is captured as a CUDA graph and replayed.
+        # Unlike raw torch.cuda.graph, the wrapped callable preserves
+        # autograd semantics (the output has a grad_fn), so RTC's
+        # autograd.grad inside denoise_step still works.
+        #
+        # First call triggers tracing + compilation (~10-30 s) and emits
+        # several inductor logs. Subsequent calls hit the graph.
+        try:
+            action_expert = self.policy._action_expert()
+            log.info("Compiling action_expert.forward_with_context with "
+                     "torch.compile(mode='reduce-overhead')...")
+            t_c = time.perf_counter()
+            action_expert.forward_with_context = torch.compile(
+                action_expert.forward_with_context,
+                mode="reduce-overhead",
+                fullgraph=False,   # safer; allows graph breaks if a Python
+                                   # op can't be traced
+                dynamic=False,     # static shapes -> better cuda-graph reuse
+            )
+            log.info("Compile wrapper installed in %.1fs (first /act will "
+                     "still pay ~10-30s tracing cost on top).",
+                     time.perf_counter() - t_c)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "torch.compile wrap failed (%s); falling back to eager. "
+                "Cuda-graph speedup will not be active.", e,
+            )
+
+        # ---------- Build the pre/post processors -----------------------
+        log.info("Building MolmoAct2 pre/post processor pipelines...")
+        t0 = time.perf_counter()
+        # dataset_stats=None triggers fallback to norm_stats.json via norm_tag.
+        self.pre, self.post = make_molmoact2_pre_post_processors(
+            self.config, dataset_stats=None
+        )
+        log.info("Processors ready in %.1fs", time.perf_counter() - t0)
+
+        # Verify the constants we hardcoded against what the checkpoint
+        # actually says. If anyone retrains with different camera keys /
+        # setup_type / control_mode / chunk_size, we fail loud here
+        # rather than silently producing garbage embeddings.
+        self._verify_norm_stats_consistency()
+
+        self.device = device
+        self.dtype = dtype
+        # Coarse serialization: predict_action_chunk isn't safe under
+        # concurrent calls (CUDA graph capture / action expert state).
+        self._lock = threading.Lock()
+
+    def _verify_norm_stats_consistency(self) -> None:
+        """Load norm_stats.json from the resolved HF snapshot and assert that
+        the camera_keys / setup_type / control_mode / chunk_size we hardcoded
+        match what's actually stored under our norm_tag. If they don't, the
+        preprocessor and the model would silently disagree on what each
+        observation key means; the model output would be garbage embeddings.
+        Fail loud at startup instead.
+        """
+        import json
+        from huggingface_hub import snapshot_download as _snap
+        local_dir = _snap(repo_id=REPO_ID)
+        ns_path = os.path.join(local_dir, "norm_stats.json")
+        with open(ns_path, "r", encoding="utf-8") as f:
+            ns = json.load(f)
+        tag_meta = ns.get("metadata_by_tag", {}).get(NORM_TAG)
+        if tag_meta is None:
+            raise RuntimeError(
+                f"norm_stats.json has no metadata for tag {NORM_TAG!r}; "
+                f"available: {list(ns.get('metadata_by_tag', {}).keys())}"
+            )
+        problems = []
+        if tag_meta.get("camera_keys") != CAMERA_KEYS:
+            problems.append(
+                f"camera_keys mismatch: hardcoded={CAMERA_KEYS} "
+                f"checkpoint={tag_meta.get('camera_keys')}"
+            )
+        if tag_meta.get("setup_type") != SETUP_TYPE:
+            problems.append(
+                f"setup_type mismatch: hardcoded={SETUP_TYPE!r} "
+                f"checkpoint={tag_meta.get('setup_type')!r}"
+            )
+        if tag_meta.get("control_mode") != CONTROL_MODE:
+            problems.append(
+                f"control_mode mismatch: hardcoded={CONTROL_MODE!r} "
+                f"checkpoint={tag_meta.get('control_mode')!r}"
+            )
+        if int(tag_meta.get("action_horizon") or 0) != CHUNK_SIZE:
+            problems.append(
+                f"action_horizon mismatch: hardcoded={CHUNK_SIZE} "
+                f"checkpoint={tag_meta.get('action_horizon')}"
+            )
+        if problems:
+            raise RuntimeError(
+                "Hardcoded server constants disagree with checkpoint "
+                "norm_stats.json:\n  - " + "\n  - ".join(problems) +
+                f"\nFix host_server_rtc.py constants to match the values in "
+                f"{ns_path} (metadata_by_tag.{NORM_TAG})."
+            )
+        log.info(
+            "Verified hardcoded constants against checkpoint norm_stats.json: "
+            "camera_keys=%s, setup_type=%r, control_mode=%r, action_horizon=%d",
+            CAMERA_KEYS, SETUP_TYPE, CONTROL_MODE, CHUNK_SIZE,
+        )
+
+    # NOTE: NO @torch.inference_mode() / @torch.no_grad() decorator.
+    # RTC's denoise_step calls torch.autograd.grad to compute a correction
+    # term during sampling (lerobot/policies/rtc/modeling_rtc.py:219). With
+    # inference_mode the activations have no grad_fn, so torch.autograd.grad
+    # raises "element 0 of tensors does not require grad and does not have
+    # a grad_fn". The model is in .eval() mode either way so no
+    # batchnorm/dropout updates happen; we just give up the inference_mode
+    # speedup. The flow-matching loop itself is the bulk of the compute.
+    def predict(
+        self,
+        top_cam: np.ndarray,
+        left_cam: np.ndarray,
+        right_cam: np.ndarray,
+        instruction: str,
+        state: np.ndarray,
+        num_steps: int = DEFAULT_NUM_STEPS,
+        prev_chunk_left_over: np.ndarray | None = None,
+        inference_delay: int = 0,
+        execution_horizon: int = 10,
+        rtc_overrides: dict | None = None,
+        seed: int | None = None,
+    ) -> tuple[np.ndarray, dict]:
+        """Run one RTC-augmented inference. Returns (actions[CHUNK_SIZE,14], meta).
+
+        meta has diagnostic fields the client can log:
+            {
+              "leftover_len_in": int,    # how many leftover steps we received
+              "execution_horizon": int,
+              "inference_delay": int,
+              "num_steps": int,
+              "max_guidance_weight": float (the value used for this request),
+              "schedule": str,
+            }
+
+        rtc_overrides: optional dict of RTCConfig fields to override for this
+        request only (max_guidance_weight, prefix_attention_schedule, debug).
+        Mutated in place under self._lock; restored after the call.
+
+        seed: if non-None, builds a torch.Generator with this seed for
+        deterministic flow-matching initial noise.
+        """
+        state_f32 = np.asarray(state, dtype=np.float32).reshape(-1)
+        if state_f32.shape != (STATE_DIM,):
+            raise ValueError(
+                f"state must be shape ({STATE_DIM},), got {state_f32.shape}"
+            )
+
+        # Wall-clock breakdown for server-side latency diagnostics:
+        #   t_pre  = pre-process (incl. image tokenization, state normalize)
+        #   t_inf  = predict_action_chunk (flow-matching denoising loop)
+        #   t_post = post-process (clamp + unnormalize + device move)
+        # All three are emitted in the meta dict so the client can see where
+        # the time is going inside the server.
+        t_predict_start = time.perf_counter()
+        # The lerobot processor pipeline's default `to_transition` is
+        # `batch_to_transition`, which expects a FLAT dict where keys
+        # starting with "observation." become the observation dict and
+        # "task" goes into complementary_data. (See
+        # lerobot.processor.converters.batch_to_transition and
+        # _extract_complementary_data.) We were previously building a
+        # TransitionKey-keyed dict, which the pipeline doesn't recognize as
+        # a batch -- the first ObservationProcessorStep then sees None.
+        batch_in: dict[str, Any] = {
+            CAMERA_KEYS[0]: _to_pil(top_cam),
+            CAMERA_KEYS[1]: _to_pil(left_cam),
+            CAMERA_KEYS[2]: _to_pil(right_cam),
+            STATE_KEY: torch.from_numpy(state_f32).to(self.device),
+            "task": str(instruction),
+        }
+
+        with self._lock:
+            # Preprocess: tokenize prompt + images, normalize state, etc.
+            t_pre_start = time.perf_counter()
+            batch = self.pre(batch_in)
+            dt_pre_ms = (time.perf_counter() - t_pre_start) * 1000.0
+
+            # Convert leftover to a torch tensor on the policy device. Shape
+            # expected by the model: (B, L, action_dim). We have B=1.
+            prev_chunk_tensor = None
+            if prev_chunk_left_over is not None and len(prev_chunk_left_over) > 0:
+                pcl = np.asarray(prev_chunk_left_over, dtype=np.float32)
+                if pcl.ndim != 2 or pcl.shape[1] != ACTION_DIM:
+                    raise ValueError(
+                        f"prev_chunk_left_over must be (L, {ACTION_DIM}), got {pcl.shape}"
+                    )
+                prev_chunk_tensor = (
+                    torch.from_numpy(pcl).to(self.device).unsqueeze(0)
+                )
+
+            # Apply per-request RTC overrides on the live config. The lock
+            # serializes /act calls so the mutation is safe across requests.
+            # Save+mutate AND predict are both inside this try/finally so the
+            # restore always runs -- even if the override loop itself raises
+            # (e.g. a setattr fails on a future read-only attribute) or if
+            # the predict_action_chunk call raises.
+            saved: dict = {}
+            try:
+                if rtc_overrides:
+                    for k, v in rtc_overrides.items():
+                        if not hasattr(self.rtc_config, k):
+                            continue
+                        if k == "prefix_attention_schedule" and isinstance(v, str):
+                            # Map string -> enum so the live config matches the
+                            # type get_prefix_weights branches on.
+                            try:
+                                from lerobot.policies.rtc.configuration_rtc import (
+                                    RTCAttentionSchedule,
+                                )
+                                v = RTCAttentionSchedule[v.upper()]
+                            except (KeyError, ImportError):
+                                log.warning("unknown prefix_attention_schedule %r; "
+                                            "falling back to default", v)
+                                continue
+                        # Snapshot AFTER we know we'll apply this override so
+                        # the saved value is only populated when we actually
+                        # set something.
+                        saved[k] = getattr(self.rtc_config, k)
+                        setattr(self.rtc_config, k, v)
+
+                # Optional deterministic seed for flow-matching noise init.
+                gen = None
+                if seed is not None:
+                    gen = torch.Generator(device=self.device).manual_seed(int(seed))
+
+                # Run the policy with RTC kwargs. inference_action_mode must
+                # be set explicitly; "continuous" matches what the BimanualYAM
+                # checkpoint was trained for (flow-matching expert).
+                #
+                # torch.no_grad() outer wrap is paper-equivalent to no wrap:
+                # lerobot's denoise_step does `with torch.enable_grad():`
+                # internally for the small region that needs autograd.grad
+                # (paper Eq. 2). enable_grad correctly escapes no_grad (unlike
+                # inference_mode, which is why we couldn't use that one).
+                # Net effect: forward pass through the vision backbone /
+                # action expert doesn't build an autograd graph it never
+                # uses. Pure speedup on the bulk of inference; math identical.
+                t_inf_start = time.perf_counter()
+                with torch.no_grad():
+                    action_chunk = self.policy.predict_action_chunk(
+                        batch,
+                        num_steps=int(num_steps),
+                        inference_delay=int(inference_delay) if inference_delay else None,
+                        prev_chunk_left_over=prev_chunk_tensor,
+                        execution_horizon=int(execution_horizon),
+                        inference_action_mode="continuous",
+                        generator=gen,
+                    )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()  # wall-clock-accurate inf timing
+                dt_inf_ms = (time.perf_counter() - t_inf_start) * 1000.0
+                # action_chunk: (B, T, action_dim) -- this is the RAW
+                # NORMALIZED output of the flow-matching trajectory. We need
+                # to keep this BEFORE post-processing so we can send it back
+                # as the leftover anchor for the next /act call -- the
+                # policy's RTC inpainting expects the leftover in the same
+                # normalized latent space as the trajectory, NOT in the
+                # de-normalized joint space the robot actually executes.
+                # (lerobot's ActionQueue captures this via the
+                # original_queue/queue split: original = raw, queue = post.)
+                raw_chunk = action_chunk.detach().clone()
+                t_post_start = time.perf_counter()
+                actions_t = self.post(action_chunk)
+                dt_post_ms = (time.perf_counter() - t_post_start) * 1000.0
+            finally:
+                # Restore the original RTCConfig values, even if anything
+                # above raised.
+                for k, v in saved.items():
+                    setattr(self.rtc_config, k, v)
+
+        # Convert both forms back to numpy. Strip the batch dim.
+        def _to_numpy(x: Any) -> np.ndarray:
+            if torch.is_tensor(x):
+                arr = x.detach().to(dtype=torch.float32, device="cpu").numpy()
+            else:
+                arr = np.asarray(x, dtype=np.float32)
+            if arr.ndim == 3 and arr.shape[0] == 1:
+                arr = arr[0]
+            return arr
+        actions_np = _to_numpy(actions_t)
+        actions_raw_np = _to_numpy(raw_chunk)
+        # Truncate raw to the same length as the processed (post can drop
+        # padding action_dim columns; raw may include them).
+        if actions_raw_np.shape[0] != actions_np.shape[0]:
+            actions_raw_np = actions_raw_np[: actions_np.shape[0]]
+        if actions_raw_np.shape[1] >= ACTION_DIM:
+            actions_raw_np = actions_raw_np[:, :ACTION_DIM]
+        # Final shape sanity check: both should be (chunk_size, action_dim).
+        if actions_np.ndim != 2 or actions_np.shape[1] != ACTION_DIM:
+            raise RuntimeError(
+                f"unexpected action shape from policy: {actions_np.shape}"
+            )
+        if actions_raw_np.shape != actions_np.shape:
+            raise RuntimeError(
+                f"raw vs processed shape mismatch: raw={actions_raw_np.shape} "
+                f"processed={actions_np.shape}"
+            )
+
+        # Capture the RTC params we actually used (after overrides). Echoing
+        # these back to the client lets it confirm the request was honored.
+        applied_max_guidance = float(rtc_overrides.get("max_guidance_weight",
+                                                       self.rtc_config.max_guidance_weight)) \
+            if rtc_overrides else float(self.rtc_config.max_guidance_weight)
+        applied_schedule = rtc_overrides.get("prefix_attention_schedule") \
+            if (rtc_overrides and "prefix_attention_schedule" in rtc_overrides) \
+            else str(self.rtc_config.prefix_attention_schedule).split(".")[-1].lower()
+
+        dt_total_ms = (time.perf_counter() - t_predict_start) * 1000.0
+        meta = {
+            "leftover_len_in": (
+                0 if prev_chunk_left_over is None else int(len(prev_chunk_left_over))
+            ),
+            "execution_horizon": int(execution_horizon),
+            "inference_delay": int(inference_delay),
+            "num_steps": int(num_steps),
+            "chunk_size": int(actions_np.shape[0]),
+            "max_guidance_weight": applied_max_guidance,
+            "schedule": str(applied_schedule).split(".")[-1].lower(),
+            "seed": seed,
+            # Server-side wall-clock breakdown (ms). Sum may be slightly less
+            # than dt_total because of lock acquisition and overrides setup.
+            "dt_pre_ms":   round(dt_pre_ms, 1),
+            "dt_inf_ms":   round(dt_inf_ms, 1),
+            "dt_post_ms":  round(dt_post_ms, 1),
+            "dt_total_ms": round(dt_total_ms, 1),
+        }
+        return actions_np, actions_raw_np, meta
+
+
+def build_app(policy: RTCPolicy, default_exec_horizon: int) -> FastAPI:
+    app = FastAPI(title="MolmoAct2-BimanualYAM RTC server", version="0.1.0")
+
+    @app.get("/act")
+    async def health() -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "repo_id": REPO_ID,
+                "norm_tag": NORM_TAG,
+                "device": policy.device,
+                "dtype": str(policy.dtype),
+                "num_cameras": NUM_CAMERAS,
+                "state_dim": STATE_DIM,
+                "action_dim": ACTION_DIM,
+                "chunk_size": CHUNK_SIZE,
+                "rtc": {
+                    "enabled": True,
+                    "execution_horizon": policy.rtc_config.execution_horizon,
+                    "max_guidance_weight": policy.rtc_config.max_guidance_weight,
+                    "schedule": str(policy.rtc_config.prefix_attention_schedule),
+                },
+            }
+        )
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    @app.post("/act")
+    async def act(request: Request) -> Response:
+        raw = await request.body()
+        try:
+            payload = json_numpy.loads(raw.decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            return _error_response(400, f"failed to decode json_numpy body: {e}")
+
+        try:
+            top_cam = payload["top_cam"]
+            left_cam = payload["left_cam"]
+            right_cam = payload["right_cam"]
+            instruction = str(payload["instruction"])
+            state = payload["state"]
+        except KeyError as e:
+            return _error_response(400, f"missing required field: {e}")
+
+        num_steps = int(payload.get("num_steps", DEFAULT_NUM_STEPS))
+        prev_left = payload.get("prev_chunk_left_over", None)
+        if prev_left is not None and not isinstance(prev_left, np.ndarray):
+            prev_left = np.asarray(prev_left, dtype=np.float32)
+        inference_delay = int(payload.get("inference_delay", 0))
+        execution_horizon = int(
+            payload.get("execution_horizon", default_exec_horizon)
+        )
+        # Per-request RTC hyperparameter overrides. Each is optional; if
+        # absent we use whatever was set in RTCConfig at server boot. They
+        # take effect only for this request (predict() restores afterwards).
+        rtc_overrides = {}
+        if "max_guidance_weight" in payload:
+            rtc_overrides["max_guidance_weight"] = float(payload["max_guidance_weight"])
+        if "prefix_attention_schedule" in payload:
+            rtc_overrides["prefix_attention_schedule"] = str(payload["prefix_attention_schedule"])
+        if "debug" in payload:
+            rtc_overrides["debug"] = bool(payload["debug"])
+        seed = payload.get("seed", None)
+        if seed is not None:
+            seed = int(seed)
+
+        t0 = time.perf_counter()
+        try:
+            actions, actions_raw, meta = policy.predict(
+                top_cam=top_cam,
+                left_cam=left_cam,
+                right_cam=right_cam,
+                instruction=instruction,
+                state=state,
+                num_steps=num_steps,
+                prev_chunk_left_over=prev_left,
+                inference_delay=inference_delay,
+                execution_horizon=execution_horizon,
+                rtc_overrides=rtc_overrides,
+                seed=seed,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("inference failed")
+            return _error_response(500, f"inference failed: {e}")
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Response carries BOTH the de-normalized chunk (for execution) and
+        # the raw normalized chunk (to be sent back as prev_chunk_left_over
+        # on the next /act). The client treats them as a paired
+        # (processed, original) bundle, mirroring lerobot ActionQueue's
+        # queue/original_queue split.
+        body = json_numpy.dumps({
+            "actions": actions,
+            "actions_raw": actions_raw,
+            "dt_ms": dt_ms,
+            "rtc": meta,
+        })
+        return Response(content=body, media_type="application/json")
+
+    return app
+
+
+def _error_response(status: int, message: str) -> Response:
+    body = json_numpy.dumps({"error": message})
+    return Response(content=body, status_code=status, media_type="application/json")
+
+
+def warmup(policy: RTCPolicy) -> None:
+    log.info("Warming up model with dummy frames...")
+    dummy_img = np.zeros((180, 320, 3), dtype=np.uint8)
+    dummy_state = np.zeros(STATE_DIM, dtype=np.float32)
+    t0 = time.perf_counter()
+    try:
+        # 1: warmup WITHOUT a leftover (the bootstrap chunk's code path).
+        policy.predict(
+            top_cam=dummy_img,
+            left_cam=dummy_img,
+            right_cam=dummy_img,
+            instruction="warmup",
+            state=dummy_state,
+            num_steps=DEFAULT_NUM_STEPS,
+            prev_chunk_left_over=None,
+            inference_delay=0,
+            execution_horizon=policy.rtc_config.execution_horizon,
+        )
+        # 2: warmup WITH a leftover (the steady-state RTC code path). Use a
+        # representative leftover length = chunk_size - execution_horizon.
+        leftover_len = max(1, CHUNK_SIZE - policy.rtc_config.execution_horizon)
+        dummy_leftover = np.zeros((leftover_len, ACTION_DIM), dtype=np.float32)
+        policy.predict(
+            top_cam=dummy_img,
+            left_cam=dummy_img,
+            right_cam=dummy_img,
+            instruction="warmup",
+            state=dummy_state,
+            num_steps=DEFAULT_NUM_STEPS,
+            prev_chunk_left_over=dummy_leftover,
+            inference_delay=2,
+            execution_horizon=policy.rtc_config.execution_horizon,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("warmup inference failed (server will still start)")
+        return
+    log.info("Warmup OK (%.1f s)", time.perf_counter() - t0)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="MolmoAct2-BimanualYAM RTC inference server"
+    )
+    p.add_argument("--host", default="0.0.0.0", help="bind address")
+    p.add_argument(
+        "--port", type=int, default=8203,
+        help="bind port (default: 8203, different from :8202 main server)",
+    )
+    p.add_argument("--repo-id", default=REPO_ID, help=f"HF repo id (default: {REPO_ID})")
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument(
+        "--dtype",
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+    )
+    p.add_argument("--no-warmup", action="store_true", help="skip warmup pass")
+    p.add_argument(
+        "--rtc-execution-horizon", type=int, default=10,
+        help="RTC execution horizon (steps before client kicks off next /act)",
+    )
+    p.add_argument(
+        "--rtc-max-guidance-weight", type=float, default=10.0,
+        help="RTC max guidance weight β (the clamp on min(β, (1-τ)/(τ·r_τ²)) "
+             "in paper Eq. 2). The paper does NOT pin β to a specific value; "
+             "10.0 matches lerobot's RTCConfig default. Higher = tighter "
+             "prefix anchoring; lower = more model freedom near chunk "
+             "boundaries.",
+    )
+    p.add_argument(
+        "--rtc-attention-schedule", default="exp",
+        choices=["linear", "exp", "zeros", "ones"],
+        help="RTC prefix attention schedule. 'exp' is paper Eq. 5 (default). "
+             "'linear' is a simpler alternative lerobot also exposes (its "
+             "RTCConfig default, but the paper's Eq. 5 is exponential). "
+             "'zeros' and 'ones' are diagnostic.",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[args.dtype]
+
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
+    policy = RTCPolicy(
+        repo_id=args.repo_id,
+        device=args.device,
+        dtype=dtype,
+        rtc_execution_horizon=args.rtc_execution_horizon,
+        rtc_max_guidance_weight=args.rtc_max_guidance_weight,
+        rtc_attention_schedule=args.rtc_attention_schedule,
+    )
+    if not args.no_warmup:
+        warmup(policy)
+
+    app = build_app(policy, default_exec_horizon=args.rtc_execution_horizon)
+
+    import uvicorn
+
+    log.info("RTC server listening on %s:%d", args.host, args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

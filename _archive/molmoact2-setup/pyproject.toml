@@ -1,0 +1,37 @@
+[project]
+name = "molmoact2-yam-setup"
+version = "0.1.0"
+description = "MolmoAct2 inference server setup for bimanual YAM (RTX 5090 host)"
+requires-python = ">=3.11,<3.12"
+# NOTE: Ai2's CLAUDE.md validated on torch 2.5.1+cu121, but that wheel has no
+# sm_120 (Blackwell / RTX 5090) kernels. Bumping to torch 2.7+ with cu128.
+dependencies = [
+    "torch>=2.7,<2.9",
+    "torchvision>=0.22,<0.24",
+    "transformers>=4.57,<4.58",
+    "tokenizers>=0.20",
+    "accelerate",
+    "safetensors",
+    "einops",
+    "fastapi",
+    "uvicorn[standard]",
+    "json-numpy",
+    "huggingface_hub[cli]",
+    "hf-transfer",
+    "pillow",
+    "numpy",
+    "requests",
+    "python-can",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
