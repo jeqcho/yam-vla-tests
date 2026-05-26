@@ -22,10 +22,20 @@ evals.
 # 3. Run an eval against it (Terminal B)
 ./scripts/run_eval.py --policy pi05 --eval ikea_10
 
-# Forward flags to the per-attempt loop after `--`:
+# All flags are flat — no more `--` passthrough:
 ./scripts/run_eval.py --policy gr00t-n17 --eval andon_10 \
-    -- --attempts 1 --horizon-stride 4 --left-cam-serial 349622072241
+    --attempts 1 --horizon-stride 4 --left-cam-serial 349622072241
+
+# Or open an interactive REPL for prompt iteration:
+./scripts/run_repl.py --policy pi05
+# > pick up the orange cube
+# [arms move...]
+# > /quit
 ```
+
+The three policies are interchangeable — the **only** thing that changes
+between them is which YAML in `configs/policy/` gets loaded. Same eval
+harness, same control loop, same safety, same journal.
 
 ## Layout
 
@@ -160,17 +170,25 @@ lines of validated hardware glue).
 
 ## What's deliberately NOT done in this refactor
 
-- **Lifting hardware/safety/journal into `core/`.** That's ~1500 lines of
-  on-hardware-tested code in `_archive/molmoact2-setup/scripts/yam_client.py`.
-  Today it's imported via `core/legacy.py`; lifting it cleanly is a follow-up.
-- **A new REPL.** The legacy `yam_repl.py` still drives the per-attempt
-  loop. The new `Policy` ABC plugs into it via a 3-line adapter in
-  `evals/_harness/runner.py`.
-- **Pushing all evals to the new harness.** Only `andon_10` and `ikea_10`
-  task YAMLs exist so far; the per-attempt operator prompts still come
-  from the legacy code.
+The three big follow-ups from the original design landed in subsequent
+commits and are no longer pending:
 
-These are tracked as TODOs in the migration commits.
+- ✅ **Lifted hardware/safety/journal into `core/`.** Now in
+  `core/{hardware,safety,journal,observability,control_loop}.py`. The
+  old `core/legacy.py` shim and its monkey-patches are deleted.
+- ✅ **New REPL** at `scripts/run_repl.py` — interactive prompt loop on
+  top of the same control loop the eval harness uses.
+- ✅ **Eval harness on pure new-code.** `evals/_harness/runner.py` calls
+  `core.run_attempt` directly, no more `_yc.main()` indirection.
+
+Remaining smaller TODOs:
+
+- **More eval task lists.** Only `andon_10` + `ikea_10` ship today; the
+  "easy-10" diagnostic suite is designed but not implemented as a
+  `tasks.yaml`.
+- **CSV columns are stable but minimal.** No per-attempt score-by-atomic
+  field for IKEA partial credit — operator scores the attempt as one
+  unit. Easy to extend.
 
 ## See also
 
