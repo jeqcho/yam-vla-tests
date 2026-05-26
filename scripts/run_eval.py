@@ -59,8 +59,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- attempt knobs ---
     grp = p.add_argument_group("attempts")
-    grp.add_argument("--attempts", type=int, default=None,
-                     help="attempts per task (default: eval's n_attempts_default)")
+    grp.add_argument("--attempts", "--samples", type=int, default=None,
+                     dest="attempts",
+                     help="attempts (a.k.a. samples) per task "
+                          "(default: eval's n_attempts_default)")
+    grp.add_argument("--reset-seconds", type=float, default=None,
+                     dest="reset_seconds",
+                     help="inter-attempt scene-reset countdown in seconds. "
+                          "Operator can press → / Enter to advance early. "
+                          "Default: per-eval value from tasks.yaml "
+                          "(0 = no countdown, advance only on key).")
     grp.add_argument("--max-chunks", type=int, default=200,
                      help="safety bound: max inference chunks per attempt "
                           "(~133 s at stride=6, 30 Hz)")
@@ -122,6 +130,17 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s | %(message)s")
 
+    # Silence i2rt's internal motor-control + CAN threads, which log to
+    # the unnamed `root` logger at INFO every 10–30 s ("Grav Comp Control
+    # Frequency", "Total rate", etc.). They flood stdout during the
+    # score-prompt window and make the operator UI unreadable. Bump root
+    # to WARNING; our own `yam_vla.*` loggers stay at INFO because they
+    # have explicit module names.
+    logging.getLogger().setLevel(logging.WARNING)
+    for name in ("yam_vla", "yam_vla.evals.runner", "yam_vla.hardware",
+                  "yam_vla.control_loop"):
+        logging.getLogger(name).setLevel(logging.INFO)
+
     p = build_parser()
     args = p.parse_args()
 
@@ -137,6 +156,15 @@ def main() -> None:
     # Per-policy stride default from YAML if user didn't override
     if args.horizon_stride is None:
         args.horizon_stride = int(cfg.control.get("horizon_stride_default", 6))
+
+    # Per-policy canonical ready pose (14-D). The runner ramps to this
+    # pose at session start and between attempts so every rollout begins
+    # from an in-distribution joint configuration. See the policy YAML
+    # for the derivation. `None` disables the ready-pose ramp entirely.
+    args.ready_pose = cfg.control.get("ready_pose")
+    args.ready_pose_ramp_duration_s = float(
+        cfg.control.get("ready_pose_ramp_duration_s", 5.0)
+    )
 
     policy = cfg.build()
     eval_def = load_tasks(eval_yaml)

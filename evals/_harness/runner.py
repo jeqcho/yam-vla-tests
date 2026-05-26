@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import select
 import signal
 import sys
 import time
@@ -42,6 +43,190 @@ from evals._harness.results import ResultsWriter, AttemptRow
 from evals._harness.tasks import EvalDefinition, EvalTask
 
 log = logging.getLogger("yam_vla.evals.runner")
+
+
+# ---------------------------------------------------------------------------
+# Raw-stdin keyboard helpers
+# ---------------------------------------------------------------------------
+#
+# The eval is "almost like training-data recording": the operator advances
+# the flow with a single key (default: right-arrow OR Enter), watches the
+# arm execute, presses → again to end the attempt, scores it, then either
+# waits out a reset countdown or presses → again to advance immediately.
+#
+# We use termios cbreak + non-blocking reads via select() so:
+#   - The countdown thread doesn't block on stdin (operator can let it
+#     expire OR interrupt it).
+#   - The attempt-stop watcher doesn't block in `input()` and hold the
+#     terminal in cooked mode.
+#
+# All helpers degrade gracefully when stdin is not a TTY (piped input,
+# CI): the raw-mode context is a no-op and `_read_key` returns None.
+
+class _RawTerm:
+    """Context manager: switch stdin to cbreak (line-buffer off, echo off)
+    and non-blocking. Restores on exit. No-op if stdin isn't a TTY."""
+
+    def __enter__(self):
+        if not sys.stdin.isatty():
+            self.fd = None
+            return self
+        import fcntl
+        import termios
+        import tty
+        self.fd = sys.stdin.fileno()
+        self._termios = termios
+        self._fcntl = fcntl
+        self.old_term = termios.tcgetattr(self.fd)
+        self.old_flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        tty.setcbreak(self.fd)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, self.old_flags | os.O_NONBLOCK)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is None:
+            return False
+        try:
+            self._termios.tcsetattr(self.fd, self._termios.TCSADRAIN, self.old_term)
+            self._fcntl.fcntl(self.fd, self._fcntl.F_SETFL, self.old_flags)
+        except Exception:
+            pass
+        return False
+
+
+def _read_key(timeout: float = 0.1) -> Optional[str]:
+    """Read one keypress from stdin. Returns a normalized name or None on
+    timeout. Must be called inside a `with _RawTerm():` block.
+
+    Returns:
+      'right' / 'left' / 'up' / 'down'  -- arrow keys (ANSI \\x1b[A-D)
+      'enter'                            -- newline / carriage return
+      'esc'                              -- bare escape
+      one-character str (lowercased)     -- any other printable
+      None                               -- timeout, or non-TTY stdin
+    """
+    if not sys.stdin.isatty():
+        return None
+    try:
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+    except (OSError, ValueError):
+        return None
+    if not r:
+        return None
+    try:
+        buf = os.read(sys.stdin.fileno(), 16)
+    except (BlockingIOError, OSError):
+        return None
+    if not buf:
+        return None
+    if buf[:1] == b"\x1b":
+        if buf[:3] == b"\x1b[A":
+            return "up"
+        if buf[:3] == b"\x1b[B":
+            return "down"
+        if buf[:3] == b"\x1b[C":
+            return "right"
+        if buf[:3] == b"\x1b[D":
+            return "left"
+        return "esc"
+    if buf in (b"\n", b"\r"):
+        return "enter"
+    try:
+        return buf.decode("utf-8", errors="replace")[:1].lower()
+    except Exception:
+        return None
+
+
+def _wait_for_advance(prompt: str = "") -> str:
+    """Block until the operator presses right-arrow, Enter, 's', 'q', 'r'.
+
+    Returns: 'go' (→ or Enter) | 'skip' (s) | 'quit' (q) | 'redo' (r).
+    Echoes the prompt once. Falls back to stdlib `input()` if stdin is
+    not a TTY.
+    """
+    if prompt:
+        print(prompt, flush=True)
+    if not sys.stdin.isatty():
+        try:
+            ans = (input("> ").strip().lower() or "")
+        except (EOFError, KeyboardInterrupt):
+            return "quit"
+        if ans in ("q", "quit"): return "quit"
+        if ans in ("s", "skip"): return "skip"
+        if ans in ("r", "redo"): return "redo"
+        return "go"
+    with _RawTerm():
+        while True:
+            key = _read_key(timeout=0.5)
+            if key is None:
+                continue
+            if key in ("right", "enter"):
+                return "go"
+            if key == "s":
+                return "skip"
+            if key == "q":
+                return "quit"
+            if key == "r":
+                return "redo"
+
+
+def _reset_countdown(seconds: float, label: str = "next attempt") -> str:
+    """Show a single-line scene-reset prompt and wait for the operator to
+    advance with → or Enter (or skip with 's', quit with 'q').
+
+    `seconds` controls the DISPLAY only — a soft target the operator can
+    use to pace themselves. The countdown counts down to zero, then the
+    display flips to "READY (waited Xs extra)" and the prompt continues
+    waiting indefinitely. The function never auto-advances on timer
+    expiry — only an operator keypress moves the eval forward.
+
+    `seconds <= 0` skips the whole reset-prompt entirely (returns
+    immediately). This preserves backward-compat for evals that
+    declared `reset_seconds_default: 0` to opt out.
+
+    Returns: 'auto' (only when seconds <= 0, i.e. skipped entirely)
+             | 'go' (→ or Enter pressed)
+             | 'skip' ('s' pressed; skip remaining attempts of this task)
+             | 'quit' ('q' pressed; abort the whole eval).
+    """
+    if seconds <= 0:
+        return "auto"
+    if not sys.stdin.isatty():
+        # Non-TTY (CI / piped): no keys available, so honor the soft
+        # target as an actual sleep and return.
+        time.sleep(seconds)
+        return "auto"
+
+    start_t = time.monotonic()
+    with _RawTerm():
+        while True:
+            elapsed = time.monotonic() - start_t
+            remaining = seconds - elapsed
+            if remaining > 0:
+                msg = (
+                    f"\r[reset] {label} in {remaining:5.1f}s  "
+                    f"(→ or Enter advance, 's' skip task, 'q' quit) "
+                )
+            else:
+                # Soft target elapsed — keep waiting until the operator
+                # actually advances. The "extra" counter is just useful
+                # feedback so they know the system isn't hung.
+                extra = -remaining
+                msg = (
+                    f"\r[reset] {label} READY  (+{extra:5.1f}s)  "
+                    f"(→ or Enter advance, 's' skip task, 'q' quit) "
+                )
+            print(f"{msg:<78s}", end="", flush=True)
+            key = _read_key(timeout=0.1)
+            if key is None:
+                continue
+            print("\r" + " " * 78 + "\r", end="", flush=True)
+            if key in ("right", "enter"):
+                return "go"
+            if key == "s":
+                return "skip"
+            if key == "q":
+                return "quit"
 
 
 # ---------------------------------------------------------------------------
@@ -113,71 +298,130 @@ def _prompt_select_prompt(task: EvalTask) -> Optional[tuple[str, str]]:
 
 def _prompt_ready(task: EvalTask, attempt: int, n_attempts: int,
                    prompt_text: str, prompt_kind: str, policy_name: str) -> str:
-    """Show context, ask operator to start. Returns 'go' / 'skip' / 'quit'."""
+    """Show task + iteration banner, wait for operator advance.
+
+    Returns 'go' / 'skip' / 'quit'.  Operator advances with right-arrow
+    OR Enter.
+    """
+    label = task.id + (f"  ({task.english})" if task.english else "")
     print("\n" + "=" * 70, flush=True)
-    print(f"[policy={policy_name}]  attempt {attempt}/{n_attempts}  prompt={prompt_kind}",
-          flush=True)
-    print(f"  task: {task.id}" + (f"  ({task.english})" if task.english else ""), flush=True)
-    print(f"  sending: {prompt_text!r}", flush=True)
+    print(f"  TASK  : {label}", flush=True)
+    print(f"  ITER  : {attempt} of {n_attempts}     [policy={policy_name}]", flush=True)
+    print(f"  PROMPT: {prompt_text!r}", flush=True)
     print("=" * 70, flush=True)
-    print("[enter to start  |  's' skip attempt  |  'q' abort eval]", flush=True)
-    sys.stdout.flush()
-    try:
-        ans = input("> ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return "quit"
-    if ans in {"q", "quit", "exit"}:
-        return "quit"
-    if ans in {"s", "skip"}:
-        return "skip"
-    return "go"
+    return _wait_for_advance(
+        "  press → or Enter to START   |   's' skip this attempt   |   'q' abort eval"
+    )
 
 
-def _prompt_score_attempt() -> tuple[str, str]:
-    """After an attempt ends, ask operator how it went. Returns (status, notes)."""
-    print("\n[score] how did it go?  s=success  f=failure  u=unclear  [enter]=skip", flush=True)
-    try:
-        ans = input("> ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return ("skip", "")
-    status_map = {"s": "success", "f": "failure", "u": "unclear"}
-    status = status_map.get(ans[:1] if ans else "", "skip")
+def _prompt_score_attempt(task: EvalTask, attempt: int, n_attempts: int) -> tuple[str, str]:
+    """After an attempt ends, ask operator how it went.
+
+    Status pick uses raw-mode single keypress (consistent with the start
+    banner — no Enter required). Notes entry stays cooked-mode so the
+    operator can type a free-form line if they want.
+    Returns (status, notes).
+    """
+    label = task.id + (f"  ({task.english})" if task.english else "")
+    print("\n" + "-" * 70, flush=True)
+    print(f"  SCORE iteration {attempt} of {n_attempts}  --  {label}", flush=True)
+    print("-" * 70, flush=True)
+    print("  s = success   f = failure   u = unclear   r = redo   [enter or →] = skip",
+          flush=True)
+
+    # Status pick: raw single keypress. We block until the operator hits
+    # one of the recognized keys, so background log spam can't accidentally
+    # eat the input.
+    if not sys.stdin.isatty():
+        # Non-TTY (piped / CI): fall back to a single line read.
+        try:
+            ans = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return ("skip", "")
+        if ans[:1] == "r":
+            return ("redo", "")
+        status_map = {"s": "success", "f": "failure", "u": "unclear"}
+        status = status_map.get(ans[:1] if ans else "", "skip")
+    else:
+        with _RawTerm():
+            while True:
+                key = _read_key(timeout=0.5)
+                if key is None:
+                    continue
+                if key == "s":
+                    status = "success"
+                    break
+                if key == "f":
+                    status = "failure"
+                    break
+                if key == "u":
+                    status = "unclear"
+                    break
+                if key == "r":
+                    return ("redo", "")
+                if key in ("enter", "right"):
+                    status = "skip"
+                    break
+                if key == "q":
+                    return ("skip", "")
+        # Echo what we recorded so the operator has visual confirmation.
+        print(f"  recorded: {status}", flush=True)
+
     notes = ""
     if status != "skip":
         try:
-            notes = input("notes (optional)\n> ").strip()
+            notes = input("notes (optional, [enter] to skip)\n> ").strip()
         except (EOFError, KeyboardInterrupt):
             notes = ""
     return status, notes
 
 
 # ---------------------------------------------------------------------------
-# Stop-watcher: hit Enter on stdin to break out of the running attempt
+# Stop-watcher: right-arrow OR Enter on stdin breaks out of the running attempt
 # ---------------------------------------------------------------------------
 
-class _EnterStopWatcher:
-    """Background thread that flips a flag when the operator hits Enter.
+class _AdvanceWatcher:
+    """Background thread that flips a flag when the operator presses
+    right-arrow (→) or Enter.
 
     Used as the `stop` predicate for run_attempt -- gives the operator a
     way to end the attempt the moment they see the task succeed/fail,
-    instead of waiting for max_chunks.
+    instead of waiting for max_chunks.  Uses raw-mode reads so the
+    operator can keep typing freely between attempts.
     """
     def __init__(self):
         self._stopped = False
+        self._stop_thread = False
         self._thread = None
 
     def start(self) -> None:
         import threading
 
-        def _wait():
-            try:
-                input()
-            except (EOFError, KeyboardInterrupt):
-                pass
-            self._stopped = True
+        def _watch():
+            # Non-TTY stdin (piped, CI): no key-watching possible; sit idle
+            # until the main thread calls stop(). Attempt will then run to
+            # max_chunks.
+            if not sys.stdin.isatty():
+                while not self._stop_thread:
+                    time.sleep(0.1)
+                return
+            with _RawTerm():
+                while not self._stop_thread:
+                    key = _read_key(timeout=0.1)
+                    if key in ("right", "enter"):
+                        self._stopped = True
+                        return
 
-        self._thread = threading.Thread(target=_wait, daemon=True)
+        self._thread = threading.Thread(target=_watch, daemon=True)
         self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the watcher thread to exit and wait for it. Must be
+        called before the main thread does any blocking stdin reads, so
+        raw mode is fully restored first."""
+        self._stop_thread = True
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
 
     @property
     def stopped(self) -> bool:
@@ -277,6 +521,36 @@ def start_session(
         log.info("[session] startup pose: %s",
                  np.array2string(startup_pose, precision=3))
 
+        # Resolve the canonical ready pose for this policy (from the
+        # policy YAML's control.ready_pose). If present, the arms ramp
+        # to it once now and back to it between every attempt -- so the
+        # policy always starts from a pose its training distribution
+        # has seen many times.
+        #
+        # Gripper indices (6 and 13) are overwritten with the startup-
+        # pose gripper values so the ramp doesn't slam-close on whatever
+        # is currently held.
+        ready_pose_cfg = getattr(args, "ready_pose", None)
+        ready_pose: Optional[np.ndarray] = None
+        ready_pose_ramp_s = float(
+            getattr(args, "ready_pose_ramp_duration_s", 5.0) or 5.0
+        )
+        if ready_pose_cfg is not None:
+            rp = np.asarray(ready_pose_cfg, dtype=np.float32)
+            if rp.shape != (14,):
+                log.warning("ready_pose has shape %s, expected (14,); skipping ramp",
+                            rp.shape)
+            else:
+                rp[6]  = startup_pose[6]
+                rp[13] = startup_pose[13]
+                ready_pose = rp
+                log.info("[session] canonical ready pose (grippers preserved): %s",
+                         np.array2string(ready_pose, precision=3))
+                log.info("Ramping to canonical ready pose (%.1fs)...", ready_pose_ramp_s)
+                ramp_to_pose(left, right, ready_pose,
+                             duration_s=ready_pose_ramp_s,
+                             label="initial move-to-ready")
+
         # ---------- per-task / per-attempt loop ----------
         n_attempts = getattr(args, "attempts", None) or eval_def.n_attempts_default
         for ti in sel:
@@ -290,7 +564,19 @@ def start_session(
                 log.info("[task %s] skipped by operator", task.id)
                 continue
 
-            for attempt in range(1, n_attempts + 1):
+            # --reset-seconds: scene-reset window between attempts of the
+            # same task. Operator can let it expire OR press → to advance
+            # immediately. 0 = no countdown (preserves ikea_10 / andon_10
+            # behavior).  Resolved here so a per-eval YAML default can
+            # apply even if --reset-seconds isn't passed on the CLI.
+            cli_reset = getattr(args, "reset_seconds", None)
+            if cli_reset is None:
+                reset_seconds = float(eval_def.reset_seconds_default)
+            else:
+                reset_seconds = float(cli_reset)
+
+            attempt = 1
+            while attempt <= n_attempts:
                 action = _prompt_ready(task, attempt, n_attempts,
                                         prompt_text, prompt_kind, policy.name)
                 if action == "quit":
@@ -303,10 +589,11 @@ def start_session(
                         attempt=attempt, status="skip",
                         prompt_kind=prompt_kind, prompt_text=prompt_text,
                     ))
+                    attempt += 1
                     continue
 
-                # Run the attempt. Operator hits Enter to end early.
-                watcher = _EnterStopWatcher()
+                # Run the attempt. Operator presses → (or Enter) to end early.
+                watcher = _AdvanceWatcher()
                 watcher.start()
                 knobs = AttemptKnobs(
                     instruction=prompt_text,
@@ -320,17 +607,52 @@ def start_session(
                     dry_run=getattr(args, "dry_run", False),
                     policy_opts={"num_steps": getattr(args, "num_steps", 10)},
                 )
-                print("\n[attempt] running. press Enter to stop early.", flush=True)
-                stats = run_attempt(
-                    policy=policy, knobs=knobs,
-                    top_cam=top, left_cam=cam_l, right_cam=cam_r,
-                    left_arm=left, right_arm=right,
-                    rerun=rerun,
-                    stop=watcher.predicate(),
-                )
+                print("\n[running] arms moving. press → (or Enter) to STOP.", flush=True)
+                try:
+                    stats = run_attempt(
+                        policy=policy, knobs=knobs,
+                        top_cam=top, left_cam=cam_l, right_cam=cam_r,
+                        left_arm=left, right_arm=right,
+                        rerun=rerun,
+                        stop=watcher.predicate(),
+                    )
+                finally:
+                    # Restore cooked stdin BEFORE the score input() call.
+                    watcher.stop()
 
-                # Score
-                status, notes = _prompt_score_attempt()
+                # Ramp back to canonical ready pose BEFORE the operator
+                # scores or resets the scene. Two reasons:
+                #   1. The next iteration's policy must start from an
+                #      in-distribution pose (the centroid of training).
+                #   2. The operator should not be resetting velcro /
+                #      cubes / cups with the arms flopped wherever the
+                #      policy abandoned them -- it's awkward and risks
+                #      grippers occluding the scene.
+                if ready_pose is not None:
+                    # Refresh gripper preservation from current state so
+                    # we don't slam-close on something the policy just
+                    # grasped (and is still holding mid-rollout).
+                    cur = np.concatenate([
+                        np.asarray(left.get_joint_pos(),  dtype=np.float32),
+                        np.asarray(right.get_joint_pos(), dtype=np.float32),
+                    ])
+                    rp_now = ready_pose.copy()
+                    rp_now[6]  = cur[6]
+                    rp_now[13] = cur[13]
+                    log.info("Ramping back to ready pose (%.1fs)...", ready_pose_ramp_s)
+                    try:
+                        ramp_to_pose(left, right, rp_now,
+                                     duration_s=ready_pose_ramp_s,
+                                     label="post-attempt ramp-to-ready")
+                    except Exception as e:
+                        log.warning("post-attempt ramp failed: %s", e)
+
+                # Score (operator types s/f/u/r/<enter>)
+                status, notes = _prompt_score_attempt(task, attempt, n_attempts)
+                if status == "redo":
+                    log.info("[task %s] iteration %d redo requested", task.id, attempt)
+                    # Same iteration runs again; no CSV row written.
+                    continue
                 results.write(AttemptRow(
                     timestamp=datetime.now().isoformat(timespec="seconds"),
                     policy=policy.name, model_id=model_id,
@@ -347,6 +669,22 @@ def start_session(
                     prompt_kind=prompt_kind, prompt_text=prompt_text,
                     notes=notes,
                 ))
+
+                # Reset window before the next attempt of this task.
+                # Last iteration of the task: no inter-attempt reset; the
+                # next task's _prompt_select_prompt + _prompt_ready give
+                # the operator their reset time.
+                if attempt < n_attempts and reset_seconds > 0:
+                    next_label = f"iter {attempt + 1} of {n_attempts}  ({task.id})"
+                    rc = _reset_countdown(reset_seconds, label=next_label)
+                    if rc == "quit":
+                        raise KeyboardInterrupt
+                    if rc == "skip":
+                        log.info("[task %s] remaining iterations skipped by operator",
+                                 task.id)
+                        break
+
+                attempt += 1
 
     except KeyboardInterrupt:
         log.info("[session] KeyboardInterrupt — shutting down")
