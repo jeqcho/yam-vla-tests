@@ -51,7 +51,6 @@ from yam_client import (  # type: ignore  # noqa: E402
     # SDK / config
     install_sdk_lock_fix,
     load_saved_config,
-    DEFAULT_SETUP_CONFIG_PATH,
 
     # Cameras
     CameraStream,
@@ -79,13 +78,41 @@ from yam_client import (  # type: ignore  # noqa: E402
     # "every robot run", with [policy=...] tags identifying provenance.
     prompt_journal_entry,
     write_journal_entry,
-    DEFAULT_JOURNAL_PATH,
 )
+import yam_client as _yc  # type: ignore  # noqa: E402
+
+# Repo-relative path overrides. The legacy yam_client module hardcodes
+# absolute paths into /home/andon/yam-tests/molmoact2-setup/... -- those
+# don't exist under the new repo layout. Rebind the module-level
+# constants so the legacy main()'s argparse defaults pick up the new
+# in-repo locations.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_JOURNAL_PATH = str(_REPO_ROOT / "journal.md")
+DEFAULT_SETUP_CONFIG_PATH = str(_REPO_ROOT / "yam_setup_config.json")
+
+_yc.DEFAULT_JOURNAL_PATH = DEFAULT_JOURNAL_PATH
+_yc.DEFAULT_SETUP_CONFIG_PATH = DEFAULT_SETUP_CONFIG_PATH
+
+# `def load_saved_config(path=DEFAULT_SETUP_CONFIG_PATH)` snapshotted the
+# original constant at function-definition time (default args are
+# evaluated once, at def time). Rebinding the module global doesn't
+# reach into __defaults__. Patch the function so its default is looked
+# up at CALL time from the module global, which we control above.
+_original_load_saved_config = _yc.load_saved_config
+
+def _load_saved_config_patched(path: str | None = None) -> dict:
+    if path is None:
+        path = _yc.DEFAULT_SETUP_CONFIG_PATH  # call-time lookup
+    return _original_load_saved_config(path)
+
+_yc.load_saved_config = _load_saved_config_patched
+load_saved_config = _load_saved_config_patched  # re-export the patched one
 
 __all__ = [
     "install_sdk_lock_fix",
     "load_saved_config",
     "DEFAULT_SETUP_CONFIG_PATH",
+    "DEFAULT_JOURNAL_PATH",
     "CameraStream",
     "RealSenseStream",
     "V4L2Stream",
@@ -98,5 +125,4 @@ __all__ = [
     "AsyncInferenceFetcher",
     "prompt_journal_entry",
     "write_journal_entry",
-    "DEFAULT_JOURNAL_PATH",
 ]
