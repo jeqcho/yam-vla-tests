@@ -117,105 +117,133 @@ TASKS: list[dict] = [
         "swedish": "FISKBO",
         "english": "8x10 picture frame",
         "instruction":
-            "Open the black panel on the back of the frame, place the "
-            "paper sheet inside, and close the panel.",
+            "Lift up the big flap, then lift up the small flap, then "
+            "place the big flap on the small flap, and put up the picture frame.",
         "atomic_actions": [
-            "Open the black panel on the back of the frame.",
-            "Place the paper sheet inside the frame.",
-            "Close the black panel on the back of the frame.",
+            "Lift up the big flap, then lift up the small flap, then "
+            "place the big flap on the small flap.",
+            "Put up the picture frame.",
         ],
     },
     {
-        "swedish": "GREJIG / BAGGMUCK",
-        "english": "shoe rack + drip tray (set of 3)",
+        "swedish": "GREJIG",
+        "english": "shoe rack (set of 3 with BAGGMUCK drip tray)",
         "instruction":
-            "Snap the two metal ends of the shoe rack into the middle "
-            "bar, then slide the gray tray underneath.",
+            "Lift up the left metal end, lift up the right metal end, "
+            "and turn the tray table upside down.",
         "atomic_actions": [
-            "Snap the two metal ends of the shoe rack into the middle bar.",
-            "Slide the gray tray underneath the shoe rack.",
+            "Lift up the left metal end.",
+            "Lift up the right metal end.",
+            "Turn the tray table upside down.",
         ],
     },
     {
         "swedish": "KLIPSK",
         "english": "bed tray",
         "instruction":
-            "Open the two legs of the white tray and stand it upright "
-            "on the table.",
+            "Lift up the left white leg, slide the left white leg into "
+            "the table, lift up the right white leg, slide the right "
+            "white leg into the table, and flip the table upright.",
         "atomic_actions": [
-            "Open the two legs of the white tray.",
-            "Stand the white tray upright on the table.",
+            "Lift up the left white leg.",
+            "Slide the left white leg into the table.",
+            "Lift up the right white leg.",
+            "Slide the right white leg into the table.",
+            "Flip the table upright.",
         ],
     },
     {
         "swedish": "KROKFJORDEN",
         "english": "two-tier shower caddy",
         "instruction":
-            "Place the small metal basket on top of the large metal "
-            "basket and hook them together.",
+            "Attach the hook to the top of the metal stand, hook the big "
+            "basket to the upper metal rod, hook the small basket to the "
+            "lower metal rod, and hang the shower caddy on the rod.",
         "atomic_actions": [
-            "Place the small metal basket on top of the large metal basket.",
-            "Hook the small metal basket and the large metal basket together.",
+            "Attach the hook to the top of the metal stand.",
+            "Hook the big basket to the upper metal rod.",
+            "Hook the small basket to the lower metal rod.",
+            "Hang the shower caddy on the rod.",
         ],
     },
     {
         "swedish": "LACK",
         "english": "side table",
         "instruction":
-            "Pick up one brown leg and twist it into the corner hole of "
-            "the brown tabletop.",
+            "Flip the table upside down. Place the screw on the hole and "
+            "screw it in place lightly. Pick up the wooden leg and place "
+            "it on top of the screw and screw it lightly in place. Turn the "
+            "wooden leg clockwise five more times to tighten it partway. "
+            "Tighten the wooden leg into the table by twisting it clockwise "
+            "until tight.",
         "atomic_actions": [
-            "Twist the brown leg into the corner hole of the brown tabletop.",
+            "Flip the table upside down.",
+            "Place the screw on the hole and screw it in place lightly.",
+            "Pick up the wooden leg and place it on top of the screw and "
+            "screw it lightly in place.",
+            "Turn the wooden leg clockwise five more times to tighten it partway.",
+            "Tighten the wooden legs into the table by twisting them "
+            "clockwise until tight.",
         ],
     },
     {
         "swedish": "LÄMPLIG",
         "english": "stainless steel trivet",
         "instruction":
-            "Pick up the metal grid and place it flat on the table.",
+            "Pick up the black square and put it to a corner, "
+            "then press on the black item until it snaps into the metal tray.",
         "atomic_actions": [
-            "Place the metal grid flat on the table.",
+            "Pick up the black square and put it on the missing corner.",
+            "Press on the black item until it snaps into the metal tray.",
         ],
     },
     {
         "swedish": "LÅNESPELARE",
         "english": "foldable laptop support",
         "instruction":
-            "Open the blue folding stand by spreading its two legs outward.",
+            "Lift up the flap, slide the flap into the stand, and flip "
+            "the laptop stand upside down.",
         "atomic_actions": [
-            "Spread the two legs of the blue folding stand outward.",
+            "Lift up the flap.",
+            "Slide the flap into the stand.",
+            "Flip the laptop stand upside down.",
         ],
     },
     {
         "swedish": "PATRULL",
         "english": "door stop",
         "instruction":
-            "Pick up the small white wedge and place it on the floor "
-            "next to the door.",
+            "Put the white strap on top of the white square, then press "
+            "the white strap onto the white square until it clicks.",
         "atomic_actions": [
-            "Place the small white wedge on the floor next to the door.",
+            "Put the white strap on top of the white square.",
+            "Press the white strap onto the white square until it clicks.",
         ],
     },
     {
         "swedish": "SKOGSRÖR",
         "english": "napkin holder",
         "instruction":
-            "Pick up the green metal piece and fold both flaps upwards.",
+            "Pick up the green metal piece, fold the left flap upwards, "
+            "and fold the right flap upwards.",
         "atomic_actions": [
-            "Fold the flap upwards.",
-            "Fold the other flap upwards.",
+            "Fold the left flap upwards.",
+            "Fold the right flap upwards.",
         ],
     },
     {
         "swedish": "VÅRSYREN",
         "english": "tealight lantern",
         "instruction":
-            "Lift the lid of the orange lantern, place the small candle "
-            "inside, and close the lid.",
+            "Fold up the left sheet, fold up the right sheet, fold the "
+            "sheets to form a cylinder, slide the hooks to lock the "
+            "sheets together, and attach the handle to the lantern.",
         "atomic_actions": [
-            "Lift the lid of the orange lantern.",
-            "Place the small candle inside the orange lantern.",
-            "Close the lid of the orange lantern.",
+            "Fold up the left sheet.",
+            "Fold up the right sheet.",
+            "Fold the sheets to form a cylinder.",
+            "Slide the hooks to lock the sheets together.",
+            "Attach the handle to the lantern.",
         ],
     },
 ]
@@ -285,9 +313,12 @@ def prompt_select_prompt(task: dict) -> Optional[tuple[str, str]]:
     """For one furniture, let operator pick which prompt to send to the VLA:
     the full instruction (default) or any one atomic action.
 
-    Returns (prompt_text_sent_to_model, kind_label) where kind_label is
-    'full' or 'atomic_N' (1-based). Returns None if operator chose to
-    skip this furniture entirely.
+    Returns (prompt_text_sent_to_model, kind_label) where kind_label is:
+      'full'       -- run N attempts on the full instruction
+      'atomic_N'   -- run N attempts on the Nth atomic action (1-based)
+      'back'       -- return to the furniture picker
+      'skip'       -- skip this furniture, advance the queue
+    Returns None if operator chose to abort the whole eval.
     """
     print("", flush=True)
     print("─" * 70, flush=True)
@@ -297,14 +328,16 @@ def prompt_select_prompt(task: dict) -> Optional[tuple[str, str]]:
     print(f"          {task['instruction']!r}", flush=True)
     for i, a in enumerate(task["atomic_actions"], 1):
         print(f"  {i}. atomic_{i}: {a!r}", flush=True)
-    print(f"  s = skip this furniture  |  q = abort eval", flush=True)
+    print(f"  b = back to furniture picker  |  s = skip this furniture  |  q = abort eval",
+          flush=True)
     sys.stdout.flush()
     try:
         ans = input("> ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return None
     if ans in {"q", "quit", "exit"}: return None
-    if ans == "s" or ans == "skip": return ("", "skip")
+    if ans in {"b", "back"}: return ("", "back")
+    if ans in {"s", "skip"}: return ("", "skip")
     if not ans:
         return (task["instruction"], "full")
     try:
@@ -319,24 +352,48 @@ def prompt_select_prompt(task: dict) -> Optional[tuple[str, str]]:
 
 def prompt_ready(task_idx: int, attempt: int, n_attempts: int,
                  task: dict, prompt_text: str, prompt_kind: str,
-                 policy: str) -> str:
-    print("\n" + "=" * 70, flush=True)
-    print(f"[policy={policy}] task {task_idx + 1}/{len(TASKS)}  |  "
-          f"attempt {attempt}/{n_attempts}  |  prompt={prompt_kind}", flush=True)
-    print(f"  {task['swedish']}  --  {task['english']}", flush=True)
-    print(f"  sending: {prompt_text!r}", flush=True)
-    print("=" * 70, flush=True)
-    print("[enter to start, 's' to skip this attempt, 'q' to abort eval]", flush=True)
-    sys.stdout.flush()
-    try:
-        ans = input("> ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return "quit"
-    if ans in {"q", "quit", "exit"}:
-        return "quit"
-    if ans == "s" or ans == "skip":
-        return "skip"
-    return "go"
+                 policy: str) -> tuple[str, str]:
+    """Returns (action, sent_prompt_text):
+      action          one of 'go' / 'skip' / 'quit'
+      sent_prompt_text  the string actually sent to the model. Equals
+                        prompt_text by default; 'e' lets the operator
+                        type an override for THIS attempt only (next
+                        attempt re-shows the original prompt).
+    """
+    while True:
+        print("\n" + "=" * 70, flush=True)
+        print(f"[policy={policy}] task {task_idx + 1}/{len(TASKS)}  |  "
+              f"attempt {attempt}/{n_attempts}  |  prompt={prompt_kind}", flush=True)
+        print(f"  {task['swedish']}  --  {task['english']}", flush=True)
+        print(f"  sending: {prompt_text!r}", flush=True)
+        print("=" * 70, flush=True)
+        print("[enter to start, 'e' to edit instruction, "
+              "'s' to skip this attempt, 'q' to abort eval]", flush=True)
+        sys.stdout.flush()
+        try:
+            ans = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "quit", prompt_text
+        if ans in {"q", "quit", "exit"}:
+            return "quit", prompt_text
+        if ans in {"s", "skip"}:
+            return "skip", prompt_text
+        if ans in {"e", "edit"}:
+            # Inline edit; override applies to THIS attempt only.
+            print(f"  current: {prompt_text!r}", flush=True)
+            print("  type new instruction (blank to cancel):", flush=True)
+            try:
+                new_text = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not new_text:
+                print("  (cancelled, keeping current)", flush=True)
+                continue
+            # Re-show the ready prompt with the new text so the operator
+            # can sanity-check before pressing enter.
+            prompt_text = new_text
+            continue
+        return "go", prompt_text
 
 
 def prompt_outcome() -> tuple[Optional[str], str]:
@@ -610,17 +667,36 @@ def main() -> None:
     backend = _build_backend(args)
     yam_backends.install_backend(backend)
 
-    # Rerun
+    # Rerun (optional). Mirrors repl_yam.py's auto-save behavior so each
+    # ikea-10 session leaves a per-tick .rrd on disk that report/
+    # extract_images.py can pull cam/top frames from later, matched per
+    # task by application_id="ikea10_eval_*" + journal wall-clock time.
     if args.rerun or args.rerun_save:
+        if args.rerun and not args.rerun_save:
+            from datetime import datetime as _dt
+            rrd_dir = os.path.join(os.path.dirname(_HERE), "..",
+                                   "eval-yam", "logs", "rrd")
+            rrd_dir = os.path.normpath(rrd_dir)
+            os.makedirs(rrd_dir, exist_ok=True)
+            args.rerun_save = os.path.join(
+                rrd_dir,
+                f"{_dt.now().strftime('%Y-%m-%d_%H%M%S')}_ikea10_{args.policy}.rrd",
+            )
+            log.info("AUTO-SAVING Rerun recording to %s", args.rerun_save)
         try:
             import rerun as rr
             yc._rr = rr
-            rr.init(f"ikea10_eval_{args.policy}", spawn=(args.rerun_connect is None))
+            rr.init(f"ikea10_eval_{args.policy}")
+            sinks = []
             if args.rerun_connect:
                 host, _, port = args.rerun_connect.partition(":")
-                rr.connect_grpc(f"rerun+http://{host}:{port}/proxy")
+                sinks.append(rr.GrpcSink(url=f"rerun+http://{host}:{port}/proxy"))
+            else:
+                rr.spawn(connect=False)
+                sinks.append(rr.GrpcSink())
             if args.rerun_save:
-                rr.save(args.rerun_save)
+                sinks.append(rr.FileSink(args.rerun_save))
+            rr.set_sinks(*sinks)
         except ImportError:
             log.error("--rerun requested but rerun-sdk not installed.")
             sys.exit(2)
@@ -727,101 +803,170 @@ def main() -> None:
     print(f"# Session: {session_ts}", flush=True)
     print("#" * 70, flush=True)
 
-    try:
-        for task_idx in selected:
-            task = TASKS[task_idx]
+    # Interactive mode = no --tasks. In interactive mode, the eval loops
+    # continuously: after N=3 attempts on a chosen prompt, we re-prompt
+    # the appropriate picker (atomic-level if the last prompt was atomic,
+    # furniture-level if the last prompt was the full instruction). With
+    # --tasks (scripted), we exit after iterating the queue once.
+    interactive = not args.tasks
+    interactive_prompt = not args.prompt_kind
 
-            # Per-task prompt selection: CLI override OR interactive picker.
-            if args.prompt_kind:
-                if args.prompt_kind == "full":
-                    prompt_text, prompt_kind = task["instruction"], "full"
-                elif args.prompt_kind.startswith("atomic_"):
-                    try:
-                        atom_idx = int(args.prompt_kind.split("_", 1)[1]) - 1
-                    except ValueError:
-                        print(f"bad --prompt-kind: {args.prompt_kind!r}", file=sys.stderr)
-                        sys.exit(2)
-                    if not (0 <= atom_idx < len(task["atomic_actions"])):
-                        log.warning("%s has no atomic_%d (only %d atoms); "
-                                    "falling back to 'full'",
-                                    task["swedish"], atom_idx + 1,
-                                    len(task["atomic_actions"]))
-                        prompt_text, prompt_kind = task["instruction"], "full"
-                    else:
-                        prompt_text = task["atomic_actions"][atom_idx]
-                        prompt_kind = f"atomic_{atom_idx+1}"
-                else:
-                    print(f"--prompt-kind must be 'full' or 'atomic_N', "
-                          f"got {args.prompt_kind!r}", file=sys.stderr)
-                    sys.exit(2)
+    def _resolve_prompt_from_cli(task: dict) -> tuple[str, str]:
+        """Map --prompt-kind to (prompt_text, prompt_kind) for scripted mode."""
+        if args.prompt_kind == "full":
+            return task["instruction"], "full"
+        if args.prompt_kind.startswith("atomic_"):
+            try:
+                atom_idx = int(args.prompt_kind.split("_", 1)[1]) - 1
+            except ValueError:
+                print(f"bad --prompt-kind: {args.prompt_kind!r}", file=sys.stderr)
+                sys.exit(2)
+            if not (0 <= atom_idx < len(task["atomic_actions"])):
+                log.warning("%s has no atomic_%d (only %d atoms); falling back to 'full'",
+                            task["swedish"], atom_idx + 1, len(task["atomic_actions"]))
+                return task["instruction"], "full"
+            return task["atomic_actions"][atom_idx], f"atomic_{atom_idx+1}"
+        print(f"--prompt-kind must be 'full' or 'atomic_N', got {args.prompt_kind!r}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    def _run_n_attempts(task_idx: int, task: dict,
+                        prompt_text: str, prompt_kind: str) -> None:
+        """Run args.attempts attempts of (task, prompt) inline.
+        Updates global_attempt, tallies, and writes to CSV + journal.
+        Raises KeyboardInterrupt if operator aborts the eval.
+        """
+        nonlocal global_attempt, aborted
+        attempt = 1
+        while attempt <= args.attempts:
+            if (task_idx + 1, attempt) in done_set:
+                log.info("task %d attempt %d already done; skipping",
+                         task_idx + 1, attempt)
+                attempt += 1
+                continue
+            action, sent_text = prompt_ready(
+                task_idx, attempt, args.attempts,
+                task, prompt_text, prompt_kind, args.policy,
+            )
+            if action == "quit":
+                aborted = True
+                raise KeyboardInterrupt
+            if action == "skip":
+                log.info("task %d (%s) attempt %d skipped",
+                         task_idx + 1, task["swedish"], attempt)
+                tallies[task_idx]["skip"] += 1
+                attempt += 1
+                continue
+
+            # If the operator edited the instruction at the ready prompt,
+            # `sent_text` differs from `prompt_text`. Use sent_text for
+            # this attempt's run + CSV + journal so the record reflects
+            # what the model ACTUALLY received. `prompt_text` (the loop
+            # variable) is unchanged so the next attempt re-shows the
+            # original prompt.
+            effective_prompt = sent_text
+            effective_kind = prompt_kind if sent_text == prompt_text else f"{prompt_kind}+edit"
+
+            global_attempt += 1
+            stats = yam_repl.run_one_attempt(
+                args, left, right, top, cam_l, cam_r,
+                effective_prompt, global_attempt, loop_t0,
+                attempt_timeout_s=args.attempt_timeout_s,
+            )
+
+            log.info("Resetting arms to ready pose (%.1fs)...", args.ramp_duration_s)
+            ramp_to_pose(left, right, ready_pose,
+                         duration_s=args.ramp_duration_s, label="reset")
+
+            status, notes = prompt_outcome()
+            if status == "redo":
+                log.info("operator REDO of task %d (%s) attempt %d",
+                         task_idx + 1, task["swedish"], attempt)
+                continue
+            if status is None:
+                log.info("attempt skipped from journal")
+                tallies[task_idx]["skip"] += 1
+                results.add(task_idx + 1, task, effective_kind, effective_prompt,
+                            attempt, "skip", notes, stats)
+                attempt += 1
             else:
-                choice = prompt_select_prompt(task)
-                if choice is None:
-                    aborted = True
-                    raise KeyboardInterrupt
-                prompt_text, prompt_kind = choice
-                if prompt_kind == "skip":
-                    log.info("furniture %s skipped at prompt-pick", task["swedish"])
-                    continue
-
-            attempt = 1
-            while attempt <= args.attempts:
-                if (task_idx + 1, attempt) in done_set:
-                    log.info("task %d attempt %d already done; skipping",
-                             task_idx + 1, attempt)
-                    attempt += 1
-                    continue
-                action = prompt_ready(task_idx, attempt, args.attempts,
-                                      task, prompt_text, prompt_kind, args.policy)
-                if action == "quit":
-                    aborted = True
-                    raise KeyboardInterrupt
-                if action == "skip":
-                    log.info("task %d (%s) attempt %d skipped",
-                             task_idx + 1, task["swedish"], attempt)
-                    tallies[task_idx]["skip"] += 1
-                    attempt += 1
-                    continue
-
-                global_attempt += 1
-                stats = yam_repl.run_one_attempt(
-                    args, left, right, top, cam_l, cam_r,
-                    prompt_text, global_attempt, loop_t0,
-                    attempt_timeout_s=args.attempt_timeout_s,
+                tallies[task_idx][status] += 1
+                tagged_notes = (
+                    f"[ikea-10 task {task_idx + 1}/{len(TASKS)}: "
+                    f"{task['swedish']} / {task['english']}] "
+                    f"[prompt={effective_kind}] "
+                    f"[policy={args.policy}] "
+                ) + (notes or "")
+                yam_repl.write_attempt_entry(
+                    args.journal_path, global_attempt,
+                    effective_prompt, status, tagged_notes, stats, args,
+                    invocation,
                 )
+                results.add(task_idx + 1, task, effective_kind, effective_prompt,
+                            attempt, status, notes, stats)
+                attempt += 1
 
-                log.info("Resetting arms to ready pose (%.1fs)...",
-                         args.ramp_duration_s)
-                ramp_to_pose(left, right, ready_pose,
-                             duration_s=args.ramp_duration_s, label="reset")
+    try:
+        # Outer loop: queue of furniture. In interactive mode, after the
+        # queue is exhausted we re-prompt the furniture picker; this
+        # loops until the user picks 'q' (then prompt_select_furniture
+        # returns None and we break).
+        outer_session_count = 0
+        while True:
+            outer_session_count += 1
+            if outer_session_count > 1:
+                # Re-prompt furniture picker between sessions in interactive mode.
+                sel = prompt_select_furniture()
+                if sel is None:
+                    log.info("operator chose to quit at furniture picker")
+                    break
+                selected = sel
 
-                status, notes = prompt_outcome()
-                if status == "redo":
-                    log.info("operator REDO of task %d (%s) attempt %d",
-                             task_idx + 1, task["swedish"], attempt)
-                    continue
-                if status is None:
-                    log.info("attempt skipped from journal")
-                    tallies[task_idx]["skip"] += 1
-                    results.add(task_idx + 1, task, prompt_kind, prompt_text,
-                                attempt, "skip", notes, stats)
-                    attempt += 1
-                else:
-                    tallies[task_idx][status] += 1
-                    tagged_notes = (
-                        f"[ikea-10 task {task_idx + 1}/{len(TASKS)}: "
-                        f"{task['swedish']} / {task['english']}] "
-                        f"[prompt={prompt_kind}] "
-                        f"[policy={args.policy}] "
-                    ) + (notes or "")
-                    yam_repl.write_attempt_entry(
-                        args.journal_path, global_attempt,
-                        prompt_text, status, tagged_notes, stats, args,
-                        invocation,
-                    )
-                    results.add(task_idx + 1, task, prompt_kind, prompt_text,
-                                attempt, status, notes, stats)
-                    attempt += 1
+            back_to_furniture_picker = False
+            for task_idx in selected:
+                task = TASKS[task_idx]
+
+                # Inner loop: for one furniture, keep re-prompting the
+                # prompt picker until the operator picks 'full' (advances
+                # to next furniture), 'b' (back to furniture picker), or
+                # 's' (skip this furniture). Each iteration runs N attempts.
+                while True:
+                    if not interactive_prompt:
+                        # Scripted: one prompt per task, no inner loop.
+                        prompt_text, prompt_kind = _resolve_prompt_from_cli(task)
+                        _run_n_attempts(task_idx, task, prompt_text, prompt_kind)
+                        break
+
+                    choice = prompt_select_prompt(task)
+                    if choice is None:
+                        aborted = True
+                        raise KeyboardInterrupt
+                    prompt_text, prompt_kind = choice
+                    if prompt_kind == "skip":
+                        log.info("furniture %s skipped", task["swedish"])
+                        break  # next furniture in queue
+                    if prompt_kind == "back":
+                        log.info("back to furniture picker from %s", task["swedish"])
+                        back_to_furniture_picker = True
+                        break
+
+                    _run_n_attempts(task_idx, task, prompt_text, prompt_kind)
+
+                    if prompt_kind.startswith("atomic_"):
+                        # Stay on this furniture; re-show the prompt picker
+                        # so operator can pick another atomic / full / b / s.
+                        continue
+                    # prompt_kind == "full": advance to next furniture.
+                    break
+
+                if back_to_furniture_picker:
+                    break  # exit for-loop, fall through to outer re-prompt
+
+            if not interactive:
+                # Scripted: one pass through --tasks, then done.
+                break
+            # Interactive: outer while True loops back to the furniture
+            # picker (next iteration's outer_session_count > 1 branch).
     except KeyboardInterrupt:
         if aborted:
             log.info("Eval aborted by operator. Tearing down.")

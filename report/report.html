@@ -1,0 +1,1507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>IKEA-10 · VLA Eval Report</title>
+<!-- Fonts self-hosted under fonts/ to avoid CDN latency on flaky wifi.
+     Regenerate with: see fonts/_google.css and the helper script. -->
+<link href="fonts/fonts.css" rel="stylesheet">
+<style>
+  @page {
+    size: letter;
+    margin: 0;
+  }
+
+  :root {
+    --paper:        #ffffff;          /* IKEA-manual-white */
+    --paper-soft:   #f5f5f5;          /* image card background */
+    --ink:          #0d1117;
+    --ink-muted:    #3a3a3a;
+    --ink-soft:     #6a6a6a;
+    --line:         #d6d6d6;
+    --line-soft:    #e8e8e8;
+    --rust:         #a23b2f;
+    --rust-deep:    #7d2b22;
+    --rust-soft:    #e8d4d1;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { background: #2a2723; }  /* dark surround like a real PDF reader */
+  body {
+    margin: 0;
+    padding: 2rem 0;
+    min-height: 100vh;
+    background: #2a2723;
+    color: var(--ink);
+    font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+    font-weight: 400;
+    font-feature-settings: "ss02", "cv11", "tnum";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .page {
+    width: 8.5in;
+    height: 11in;
+    padding: 0.45in 0.5in 0.4in;
+    background: var(--paper);
+    position: relative;
+    display: none;            /* SCREEN: hide all by default; .active is shown */
+    flex-direction: column;
+    overflow: hidden;
+    page-break-after: always;
+    margin: 0 auto;
+    box-shadow:
+      0 30px 60px -20px rgba(0, 0, 0, 0.5),
+      0 18px 36px -18px rgba(0, 0, 0, 0.4),
+      0 0 0 0.5px rgba(0, 0, 0, 0.15);
+    border-radius: 1px;
+  }
+  .page.active { display: flex; }   /* show the one selected by nav */
+  .page:last-of-type { page-break-after: auto; }
+
+  /* ============================================================ */
+  /* MASTHEAD  -- thin publication band at top of every page      */
+  /* ============================================================ */
+  .masthead {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    border-bottom: 0.5px solid var(--line);
+    padding-bottom: 0.35rem;
+    margin-bottom: 0.85rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .masthead-page {
+    font-variant-numeric: tabular-nums;
+    color: var(--ink-soft);
+  }
+
+  .page-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  /* ============================================================ */
+  /* GRID  -- 2 columns × 3 rows, equal cells                     */
+  /* ============================================================ */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    /* Header is text-only (title + english), so row 1 is compact;
+       remaining height goes to product (spans 1-2), manual (spans
+       2-3), and bottom row with rerun + bars. Slight asymmetry
+       between product (1.6fr) and manual (2fr) reads as editorial
+       stagger rather than imbalance. */
+    grid-template-rows: 0.6fr 1fr 1fr 1fr;
+    grid-template-areas:
+      "header  product"
+      "manual  product"
+      "manual  atomic"
+      "rerun   bars";
+    gap: 0.45rem 0.7rem;
+    flex: 1;
+    min-height: 0;
+  }
+  .cell-header  { grid-area: header; }
+  .cell-product { grid-area: product; }
+  .cell-manual  { grid-area: manual; }
+  .cell-atomic  { grid-area: atomic; }
+  .cell-rerun   { grid-area: rerun; }
+  .cell-bars    { grid-area: bars; }
+  .cell {
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  /* Eyebrow label that sits above each cell (mono small caps).
+     Gives the report a strong editorial / catalog rhythm. */
+  .cell-eyebrow {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding-bottom: 0.3rem;
+    border-bottom: 0.5px solid var(--line);
+    margin-bottom: 0.5rem;
+    font-family: "IBM Plex Mono", monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 8.5px;
+    line-height: 1;
+  }
+  .eyebrow-num { color: var(--rust); font-weight: 500; }
+  .eyebrow-label { color: var(--ink-soft); }
+
+  /* Image cells: borderless, transparent. Image fills available space
+     (object-fit:contain) — letterboxing matches paper white so it
+     reads as natural margin rather than a framed empty cell. */
+  .cell-frame {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  .cell-frame img,
+  .cell-frame .image-placeholder {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .cell-frame .image-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45rem;
+    color: var(--ink-soft);
+    font-family: "IBM Plex Mono", monospace;
+    background:
+      repeating-linear-gradient(
+        45deg,
+        var(--paper), var(--paper) 8px,
+        var(--paper-soft) 8px, var(--paper-soft) 16px
+      );
+  }
+  .cell-frame .image-placeholder .ph-icon {
+    font-size: 1.4rem;
+    line-height: 1;
+    color: var(--line);
+  }
+  .cell-frame .image-placeholder .ph-text {
+    font-size: 8.5px;
+    color: var(--ink-soft);
+    letter-spacing: 0.04em;
+    opacity: 0.7;
+  }
+
+  /* ============================================================ */
+  /* HEADER CELL  -- Swedish name + English + pull-quote          */
+  /* ============================================================ */
+  .cell-header {
+    /* Title + subtitle fill the compact header row cleanly. */
+    justify-content: center;
+    padding: 0.15rem 0 0.1rem;
+  }
+  .swedish {
+    font-family: "Fraunces", "Cormorant Garamond", Georgia, serif;
+    font-optical-sizing: auto;
+    font-variation-settings: "SOFT" 100, "WONK" 0, "opsz" 144;
+    font-size: 52px;
+    font-weight: 400;
+    letter-spacing: -0.022em;
+    line-height: 0.9;
+    margin: 0;
+    color: var(--ink);
+  }
+  .english {
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: 11.5px;
+    font-weight: 400;
+    font-style: italic;
+    color: var(--ink-soft);
+    margin: 0.3rem 0 0 0;
+    letter-spacing: 0.005em;
+  }
+
+  /* ============================================================ */
+  /* ATOMIC LIST cell                                              */
+  /* ============================================================ */
+  .atomic-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    counter-reset: none;
+    flex: 1;
+    overflow: hidden;
+  }
+  .atom {
+    display: grid;
+    grid-template-columns: 1.2rem 1.6rem 1fr;
+    align-items: baseline;
+    gap: 0.45rem;
+    padding: 0.42rem 0;
+    border-bottom: 0.5px dotted var(--line-soft);
+  }
+  .atom:last-child { border-bottom: none; }
+  .atom-mark {
+    width: 9px;
+    height: 9px;
+    border: 1px solid var(--ink-soft);
+    border-radius: 1px;
+    display: inline-block;
+    justify-self: center;
+    align-self: center;
+  }
+  .atom-num {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 9px;
+    color: var(--rust);
+    letter-spacing: 0.05em;
+    font-weight: 500;
+  }
+  .atom-text {
+    font-family: "Fraunces", Georgia, serif;
+    font-variation-settings: "opsz" 18;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.4;
+    color: var(--ink);
+  }
+
+  /* ============================================================ */
+  /* OUTCOME (chart)                                               */
+  /* ============================================================ */
+  .chart {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-around;
+    flex: 1;
+    padding: 0.25rem 0;
+  }
+  .bar-row {
+    display: grid;
+    grid-template-columns: 1fr 4.8rem;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.4rem 0;
+  }
+  .bar-label-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 0.2rem;
+  }
+  .bar-name {
+    font-family: "Fraunces", Georgia, serif;
+    font-variation-settings: "opsz" 24;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink);
+    line-height: 1;
+  }
+  .bar-meta {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 8px;
+    color: var(--ink-soft);
+    letter-spacing: 0.05em;
+  }
+
+  .bar-track {
+    position: relative;
+    height: 18px;
+    background: transparent;
+    border-top: 0.5px solid var(--line);
+    border-bottom: 0.5px solid var(--line);
+    overflow: visible;
+  }
+  .bar-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 0%;
+    background: var(--ink);
+  }
+  .bar-track::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: -3px;
+    bottom: -3px;
+    width: 2px;
+    background: var(--rust);
+  }
+  .bar-zero,
+  .bar-end {
+    position: absolute;
+    bottom: -11px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 7px;
+    color: var(--ink-soft);
+    letter-spacing: 0.05em;
+  }
+  .bar-zero { left: 0; }
+  .bar-end { right: 0; }
+  .bar-row.fail .bar-track {
+    background: repeating-linear-gradient(
+      90deg,
+      transparent, transparent 6px,
+      var(--rust-soft) 6px, var(--rust-soft) 7px
+    );
+    opacity: 0.6;
+  }
+
+  .bar-value {
+    text-align: right;
+    line-height: 1;
+  }
+  .bar-pct {
+    display: block;
+    font-family: "Fraunces", Georgia, serif;
+    font-variation-settings: "opsz" 144;
+    font-size: 22px;
+    font-weight: 400;
+    color: var(--rust);
+    line-height: 1;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .pct-sign {
+    font-size: 0.55em;
+    color: var(--rust);
+    margin-left: 0.05em;
+    vertical-align: 0.3em;
+  }
+  .bar-status {
+    display: block;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 7.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--rust);
+    margin-top: 0.18rem;
+    font-weight: 500;
+  }
+  .bar-frac {
+    display: block;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 8px;
+    color: var(--ink-soft);
+    letter-spacing: 0.04em;
+    margin-top: 0.1rem;
+  }
+
+  /* ============================================================ */
+  /* PAGE NAV (browser-only)                                       */
+  /* ============================================================ */
+  .page-nav {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    background: var(--ink);
+    color: var(--paper);
+    padding: 0.45rem 0.55rem;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    border-radius: 999px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    box-shadow: 0 8px 28px rgba(13, 17, 23, 0.18),
+                0 2px 6px rgba(13, 17, 23, 0.12);
+    z-index: 1000;
+    user-select: none;
+  }
+  .page-nav button {
+    background: none;
+    border: none;
+    color: var(--paper);
+    cursor: pointer;
+    font-size: 16px;
+    padding: 0.25rem 0.55rem;
+    font-family: inherit;
+    border-radius: 999px;
+    transition: background 120ms ease, color 120ms ease;
+  }
+  .page-nav button:hover { background: rgba(255,255,255,0.08); }
+  .page-nav button:disabled { opacity: 0.3; cursor: not-allowed; }
+  .page-nav button:disabled:hover { background: none; }
+  .page-nav .nav-pos {
+    font-variant-numeric: tabular-nums;
+    padding: 0 0.35rem;
+    color: rgba(247, 244, 236, 0.7);
+  }
+  .page-nav .nav-pos .nav-cur { color: var(--paper); }
+  .page-nav .nav-hint {
+    margin-left: 0.5rem;
+    padding-left: 0.6rem;
+    border-left: 0.5px solid rgba(255,255,255,0.18);
+    color: rgba(247, 244, 236, 0.45);
+    font-size: 9px;
+    letter-spacing: 0.1em;
+  }
+
+  /* ============================================================ */
+  /* PRINT                                                         */
+  /* ============================================================ */
+  @media print {
+    html, body {
+      background: var(--paper);
+      padding: 0;
+      display: block;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    .page {
+      display: flex !important;       /* show ALL pages for print */
+      box-shadow: none;
+      border-radius: 0;
+      margin: 0;
+      /* Mirror screen dimensions exactly so content that fits the
+         on-screen view also fits the printed page. height: auto would
+         let cells overflow into a second physical page when print
+         padding > screen padding. */
+      width: 8.5in;
+      height: 11in;
+      padding: 0.45in 0.5in 0.4in;
+      overflow: hidden;
+    }
+    .page-nav { display: none !important; }
+  }
+</style>
+</head>
+<body>
+  <section class="page" id="fiskbo">
+    <div class="masthead">
+      <span class="masthead-page">01 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">FISKBO</h1>
+          <p class="english">8x10 picture frame</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/fiskbo/product.png" alt="FISKBO IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/fiskbo/manual.png" alt="FISKBO IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Lift up the big flap, then lift up the small flap, then place the big flap on the small flap.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Put up the picture frame.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/fiskbo/rerun.png" alt="FISKBO robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="grejig">
+    <div class="masthead">
+      <span class="masthead-page">02 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">GREJIG</h1>
+          <p class="english">shoe rack (set of 3 with BAGGMUCK drip tray)</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/grejig/product.png" alt="GREJIG IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/grejig/manual.png" alt="GREJIG IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Lift up the left metal end.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Lift up the right metal end.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">03</span>
+              <span class="atom-text">Turn the tray table upside down.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/grejig/rerun.png" alt="GREJIG robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="klipsk">
+    <div class="masthead">
+      <span class="masthead-page">03 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">KLIPSK</h1>
+          <p class="english">bed tray</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/klipsk/product.png" alt="KLIPSK IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/klipsk/manual.png" alt="KLIPSK IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Lift up the left white leg.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Slide the left white leg into the table.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">03</span>
+              <span class="atom-text">Lift up the right white leg.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">04</span>
+              <span class="atom-text">Slide the right white leg into the table.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">05</span>
+              <span class="atom-text">Flip the table upright.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/klipsk/rerun.png" alt="KLIPSK robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="lack">
+    <div class="masthead">
+      <span class="masthead-page">04 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">LACK</h1>
+          <p class="english">side table</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/lack/product.png" alt="LACK IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/lack/manual.png" alt="LACK IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Flip the table upside down.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Place the screw on the hole and screw it in place lightly.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">03</span>
+              <span class="atom-text">Pick up the wooden leg and place it on top of the screw and screw it lightly in place.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">04</span>
+              <span class="atom-text">Turn the wooden leg clockwise five more times to tighten it partway.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">05</span>
+              <span class="atom-text">Tighten the wooden legs into the table by twisting them clockwise until tight.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/lack/rerun.png" alt="LACK robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="lamplig">
+    <div class="masthead">
+      <span class="masthead-page">05 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">LÄMPLIG</h1>
+          <p class="english">stainless steel trivet</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/lamplig/product.png" alt="LÄMPLIG IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/lamplig/manual.png" alt="LÄMPLIG IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Pick up the black square and put it on the missing corner.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Press on the black item until it snaps into the metal tray.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/lamplig/rerun.png" alt="LÄMPLIG robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="lanespelare">
+    <div class="masthead">
+      <span class="masthead-page">06 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">LÅNESPELARE</h1>
+          <p class="english">foldable laptop support</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/lanespelare/product.png" alt="LÅNESPELARE IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/lanespelare/manual.png" alt="LÅNESPELARE IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Lift up the flap.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Slide the flap into the stand.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">03</span>
+              <span class="atom-text">Flip the laptop stand upside down.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/lanespelare/rerun.png" alt="LÅNESPELARE robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="patrull">
+    <div class="masthead">
+      <span class="masthead-page">07 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">PATRULL</h1>
+          <p class="english">door stop</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/patrull/product.png" alt="PATRULL IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/patrull/manual.png" alt="PATRULL IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Put the white strap on top of the white square.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Press the white strap onto the white square until it clicks.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/patrull/rerun.png" alt="PATRULL robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="skogsror">
+    <div class="masthead">
+      <span class="masthead-page">08 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">SKOGSRÖR</h1>
+          <p class="english">napkin holder</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/skogsror/product.png" alt="SKOGSRÖR IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/skogsror/manual.png" alt="SKOGSRÖR IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Fold the left flap upwards.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Fold the right flap upwards.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/skogsror/rerun.png" alt="SKOGSRÖR robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="varsyren">
+    <div class="masthead">
+      <span class="masthead-page">09 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">VÅRSYREN</h1>
+          <p class="english">tealight lantern</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/varsyren/product.png" alt="VÅRSYREN IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/varsyren/manual.png" alt="VÅRSYREN IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Fold up the left sheet.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Fold up the right sheet.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">03</span>
+              <span class="atom-text">Fold the sheets to form a cylinder.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">04</span>
+              <span class="atom-text">Slide the hooks to lock the sheets together.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">05</span>
+              <span class="atom-text">Attach the handle to the lantern.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><img src="images/varsyren/rerun.png" alt="VÅRSYREN robot execution"></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="krokfjorden">
+    <div class="masthead">
+      <span class="masthead-page">10 / 10</span>
+    </div>
+    <div class="page-body">
+      <div class="grid">
+        <div class="cell cell-header">
+          <h1 class="swedish">KROKFJORDEN</h1>
+          <p class="english">two-tier shower caddy</p>
+        </div>
+        <figure class="cell cell-product">
+          <div class="cell-eyebrow">Product</div>
+          <div class="cell-frame"><img src="images/krokfjorden/product.png" alt="KROKFJORDEN IKEA product photo"></div>
+        </figure>
+        <figure class="cell cell-manual">
+          <div class="cell-eyebrow">Manual</div>
+          <div class="cell-frame"><img src="images/krokfjorden/manual.png" alt="KROKFJORDEN IKEA assembly manual"></div>
+        </figure>
+        <div class="cell cell-atomic">
+          <div class="cell-eyebrow">Tasks</div>
+          <ol class="atomic-list">
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">01</span>
+              <span class="atom-text">Attach the hook to the top of the metal stand.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">02</span>
+              <span class="atom-text">Hook the big basket to the upper metal rod.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">03</span>
+              <span class="atom-text">Hook the small basket to the lower metal rod.</span>
+            </li>
+            <li class="atom">
+              <span class="atom-mark"></span>
+              <span class="atom-num">04</span>
+              <span class="atom-text">Hang the shower caddy on the rod.</span>
+            </li>
+
+          </ol>
+        </div>
+        <figure class="cell cell-rerun">
+          <div class="cell-eyebrow">Real-world rollouts</div>
+          <div class="cell-frame"><div class="image-placeholder"><span class="ph-icon">▢</span><span class="ph-text">images/krokfjorden/rerun.png</span></div></div>
+        </figure>
+        <div class="cell cell-bars">
+          <div class="cell-eyebrow">Success rates&nbsp;·&nbsp;N=3</div>
+          <div class="chart">
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">MolmoAct2</span>
+                  <span class="bar-meta"></span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">GR00T-N1.7</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+            <div class="bar-row fail">
+              <div class="bar-col">
+                <div class="bar-label-row">
+                  <span class="bar-name">Pi-0.5 + YAM</span>
+                  <span class="bar-meta">finetuned on MolmoAct2 YAM dataset</span>
+                </div>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: 0%"></div>
+                </div>
+              </div>
+              <div class="bar-value">
+                <span class="bar-pct">0<span class="pct-sign">%</span></span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+<nav class="page-nav" aria-label="Page navigation">
+  <button id="nav-prev" aria-label="Previous page">&larr;</button>
+  <span class="nav-pos"><span class="nav-cur" id="nav-cur">01</span> / <span id="nav-total">10</span></span>
+  <button id="nav-next" aria-label="Next page">&rarr;</button>
+  <span class="nav-hint">&larr; &rarr; / j k</span>
+</nav>
+<script>
+(function() {
+  var pages = Array.prototype.slice.call(document.querySelectorAll('.page'));
+  if (!pages.length) return;
+  var prev = document.getElementById('nav-prev');
+  var next = document.getElementById('nav-next');
+  var cur = document.getElementById('nav-cur');
+  var total = document.getElementById('nav-total');
+  total.textContent = String(pages.length).padStart(2, '0');
+
+  // One-page-at-a-time viewer: only .page.active is rendered.
+  // URL hash (#slug) keeps deep links + browser back/forward working.
+  var idx = 0;
+  function indexFromHash() {
+    var h = (window.location.hash || '').replace(/^#/, '');
+    if (!h) return 0;
+    for (var i = 0; i < pages.length; i++) {
+      if (pages[i].id === h) return i;
+    }
+    return 0;
+  }
+  function render() {
+    for (var i = 0; i < pages.length; i++) {
+      pages[i].classList.toggle('active', i === idx);
+    }
+    cur.textContent = String(idx + 1).padStart(2, '0');
+    prev.disabled = (idx === 0);
+    next.disabled = (idx === pages.length - 1);
+    var newHash = '#' + pages[idx].id;
+    if (window.location.hash !== newHash) {
+      // replaceState avoids polluting browser back-button history with
+      // every page flip; user's browser back still leaves the report.
+      history.replaceState(null, '', newHash);
+    }
+    window.scrollTo({top: 0, behavior: 'instant'});
+  }
+  function go(i) {
+    idx = Math.max(0, Math.min(pages.length - 1, i));
+    render();
+  }
+
+  prev.addEventListener('click', function() { go(idx - 1); });
+  next.addEventListener('click', function() { go(idx + 1); });
+
+  document.addEventListener('keydown', function(e) {
+    var t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === 'j' || e.key === ' ') {
+      e.preventDefault(); go(idx + 1);
+    } else if (e.key === 'ArrowLeft' || e.key === 'PageUp' || e.key === 'k') {
+      e.preventDefault(); go(idx - 1);
+    } else if (e.key === 'Home') {
+      e.preventDefault(); go(0);
+    } else if (e.key === 'End') {
+      e.preventDefault(); go(pages.length - 1);
+    }
+  });
+
+  // Initial state from URL hash (so refresh keeps you on the same page).
+  idx = indexFromHash();
+  render();
+})();
+</script>
+</body>
+</html>

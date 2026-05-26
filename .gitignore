@@ -1,3 +1,6 @@
 eval/results/
 __pycache__/
 *.pyc
+# Local dev-only scratch dir (rerun frame classification contact sheet).
+# docs/ is the published Pages output and is tracked.
+report/scratch/
