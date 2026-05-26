@@ -1,0 +1,26 @@
+# MolmoAct2 — AllenAI bimanual YAM finetune.
+# Wire format: HTTP + json_numpy on port 8202.
+# Server source: _archive/molmoact2-setup/molmoact2/examples/yam/host_server_yam.py
+
+policy: molmoact2
+model_id: allenai/MolmoAct2-BimanualYAM
+transport:
+  scheme: http
+  host: 127.0.0.1
+  port: 8202
+  path: /act
+
+# role -> wire image key. Change here if a future checkpoint renames.
+image_keys:
+  top: top_cam
+  left_wrist: left_cam
+  right_wrist: right_cam
+
+# Backend-specific knobs (passed through Policy.predict as **opts).
+options:
+  num_steps: 10            # flow-matching solver steps; +N = slower, smoother
+
+# Used by configs/eval/* to set sensible defaults for the control loop.
+control:
+  action_horizon_hint: 30  # checkpoint default; the actual horizon is on Prediction
+  horizon_stride_default: 6

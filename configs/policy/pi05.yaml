@@ -1,0 +1,30 @@
+# π₀.₅ — jeqcho openpi finetune.
+# Wire format: WebSocket + msgpack via openpi-client on port 8000.
+# Server source: vendored openpi (see servers/pi05/run.sh).
+
+policy: pi05
+model_id: jeqcho/pi05-yam-bimanual
+transport:
+  scheme: ws
+  host: 127.0.0.1
+  port: 8000
+  # api_key: ${PI05_API_KEY}    # uncomment if you put openpi behind a key
+
+# CRITICAL: these are the CANONICAL openpi internal image keys.
+# The agilex AlohaInputs.STANDARD_IMAGE_KEYS list is the authority.
+# Sending cam_high/cam_left_wrist instead = model receives zeros and
+# runs blind (no error, just bad actions).
+image_keys:
+  top: base_0_rgb
+  left_wrist: left_wrist_0_rgb
+  right_wrist: right_wrist_0_rgb
+
+# yam_pi05 TrainConfig knobs (used by servers/pi05/register_yam_pi05.py,
+# not by the client). Documented here for provenance.
+training_config:
+  adapt_to_pi: false           # YAM is NOT Trossen Aloha — don't flip joints
+  use_delta_joint_actions: false  # training fork's setting
+
+control:
+  action_horizon_hint: 16
+  horizon_stride_default: 8

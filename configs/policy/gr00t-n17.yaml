@@ -1,0 +1,26 @@
+# GR00T N1.7 — jeqcho YAM finetune of nvidia/GR00T-N1.7-3B.
+# Wire format: ZeroMQ REQ/REP + msgpack-numpy on port 5556.
+# Server source: vendored Isaac-GR00T (see servers/gr00t-n17/run.sh).
+
+policy: gr00t-n17
+model_id: jeqcho/gr00t-n17-yam-bimanual
+transport:
+  scheme: zmq
+  host: 127.0.0.1
+  port: 5556
+  timeout_ms: 30000
+
+# role -> server video-key. The checkpoint's experiment_cfg/conf.yaml
+# under data.modality_configs.new_embodiment.video.modality_keys is the
+# source of truth — copy from there when finetuning a new checkpoint.
+image_keys:
+  top: top
+  left_wrist: left
+  right_wrist: right
+
+language_key: annotation.human.task_description
+embodiment_tag: NEW_EMBODIMENT
+
+control:
+  action_horizon_hint: 16
+  horizon_stride_default: 4

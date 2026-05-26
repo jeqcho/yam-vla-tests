@@ -11,6 +11,7 @@ from yam_vla.core.observation import (
     RIGHT_GRIP,
 )
 from yam_vla.core.policy import Policy, Prediction, ServerInfo
+from yam_vla.core.config import PolicyConfig
 
 __all__ = [
     "ImageRole",
@@ -19,6 +20,7 @@ __all__ = [
     "Policy",
     "Prediction",
     "ServerInfo",
+    "PolicyConfig",
     "STATE_DIM",
     "ARM_DOF",
     "LEFT_ARM",
