@@ -392,6 +392,75 @@ def ramp_to_pose(
     time.sleep(0.5)  # PD settle
 
 
+# ---------------------------------------------------------------------------
+# Canonical "ready" pose computed from a policy's norm_stats.json
+# ---------------------------------------------------------------------------
+
+def load_canonical_ready_pose(
+    norm_stats_path: str | "os.PathLike",
+    norm_tag: str,
+    *,
+    decimals: int = 2,
+    mirror_symmetrize: bool = True,
+) -> "np.ndarray":
+    """Return a 14-D "ready" joint pose for bimanual YAM, derived from a
+    policy's training-action stats.
+
+    The raw `action_stats.mean` from `norm_stats.json` is the centroid of
+    the training-action distribution -- a pose every training trajectory
+    was near. That's the right place to start inference from: the policy
+    has seen this pose many times and will produce in-distribution
+    actions from it.
+
+    With `mirror_symmetrize=True` (the default), the left/right arms are
+    forced into exact bilateral symmetry. The YAM rig's mirror joints
+    (1: shoulder yaw, 5: wrist roll, 6: wrist pitch) carry opposite
+    signs in the training mean; non-mirror joints (2-4 + gripper)
+    carry same-sign values. We take the per-joint magnitude average
+    across (|left|, |right|) and reapply the original sign pattern.
+    This removes training-noise asymmetries -- e.g., the model may have
+    seen 5% more left-handed grasps than right-handed, slightly biasing
+    the raw mean -- and gives a canonical pose that's the same up to
+    reflection across the rig's centerline.
+
+    Both gripper values (indices 6 and 13) are returned at whatever the
+    averaged-mean produced; callers who want to PRESERVE the current
+    gripper opening (e.g. so a ready-pose ramp doesn't slam-close on
+    whatever is held) should overwrite those indices after this call.
+
+    Returns a (14,) float32 ndarray, rounded to `decimals` places.
+    """
+    import json as _json
+    import numpy as _np
+    with open(norm_stats_path) as f:
+        data = _json.load(f)
+    try:
+        mean = _np.asarray(
+            data["metadata_by_tag"][norm_tag]["action_stats"]["mean"],
+            dtype=_np.float32,
+        )
+    except KeyError as e:
+        raise ValueError(
+            f"norm_stats at {norm_stats_path} has no "
+            f"metadata_by_tag[{norm_tag!r}].action_stats.mean: {e}"
+        ) from e
+    if mean.shape != (14,):
+        raise ValueError(f"expected 14-D action_stats.mean, got {mean.shape}")
+    if not mirror_symmetrize:
+        return _np.round(mean, decimals).astype(_np.float32)
+
+    left = mean[:7]
+    right = mean[7:]
+    sign_l = _np.sign(left)
+    sign_r = _np.sign(right)
+    # Magnitude average per joint pair (preserves the centroid scale).
+    mag = (_np.abs(left) + _np.abs(right)) * 0.5
+    sym = _np.empty(14, dtype=_np.float32)
+    sym[:7] = sign_l * mag
+    sym[7:] = sign_r * mag
+    return _np.round(sym, decimals).astype(_np.float32)
+
+
 __all__ = [
     # constants
     "DEFAULT_TRAIN_FPS", "DEFAULT_HORIZON_STRIDE",
@@ -403,4 +472,6 @@ __all__ = [
     "CameraStream", "RealSenseStream", "V4L2Stream", "make_camera",
     # arms
     "init_arm", "read_state", "ramp_to_pose",
+    # canonical ready pose
+    "load_canonical_ready_pose",
 ]
