@@ -1,0 +1,11 @@
+{
+  "left_can": "can0",
+  "right_can": "can1",
+  "gripper": "linear_4310",
+  "top_cam_v4l2": "/dev/v4l/by-id/usb-SONix_Technology_Co.__Ltd._Streaming_Camera_SN0001-video-index0",
+  "left_cam_serial": "427622271914",
+  "right_cam_serial": "352122272708",
+  "server_host": "127.0.0.1",
+  "server_port": 5556,
+  "_comment": "Same hardware as molmoact2-setup/yam_setup_config.json. Port 5556 is the GR00T server (MolmoAct2 lives on 8202). Camera serials carry over -- they're hardware IDs, not model-specific."
+}
