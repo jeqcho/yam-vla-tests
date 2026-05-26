@@ -1,0 +1,116 @@
+name: ikea_10
+description: |
+  10 IKEA 1-page-assembly products. Each task is a multi-step assembly
+  whose `atomic_actions` enable partial-credit scoring per sub-task.
+  Migrated from ikea-10/eval/eval_ikea_tasks.py.
+n_attempts_default: 3
+
+tasks:
+  - id: FISKBO
+    english: 8x10 picture frame
+    instruction: >-
+      Lift up the big flap, then lift up the small flap, then place the big
+      flap on the small flap, and put up the picture frame.
+    atomic_actions:
+      - "Lift up the big flap, then lift up the small flap, then place the big flap on the small flap."
+      - "Put up the picture frame."
+
+  - id: GREJIG
+    english: shoe rack (set of 3 with BAGGMUCK drip tray)
+    instruction: >-
+      Lift up the left metal end, lift up the right metal end, and turn the
+      tray table upside down.
+    atomic_actions:
+      - "Lift up the left metal end."
+      - "Lift up the right metal end."
+      - "Turn the tray table upside down."
+
+  - id: KLIPSK
+    english: bed tray
+    instruction: >-
+      Lift up the left white leg, slide the left white leg into the table,
+      lift up the right white leg, slide the right white leg into the table,
+      and flip the table upright.
+    atomic_actions:
+      - "Lift up the left white leg."
+      - "Slide the left white leg into the table."
+      - "Lift up the right white leg."
+      - "Slide the right white leg into the table."
+      - "Flip the table upright."
+
+  - id: KROKFJORDEN
+    english: two-tier shower caddy
+    instruction: >-
+      Attach the hook to the top of the metal stand, hook the big basket to
+      the upper metal rod, hook the small basket to the lower metal rod, and
+      hang the shower caddy on the rod.
+    atomic_actions:
+      - "Attach the hook to the top of the metal stand."
+      - "Hook the big basket to the upper metal rod."
+      - "Hook the small basket to the lower metal rod."
+      - "Hang the shower caddy on the rod."
+
+  - id: LACK
+    english: side table
+    instruction: >-
+      Flip the table upside down. Place the screw on the hole and screw it in
+      place lightly. Pick up the wooden leg and place it on top of the screw
+      and screw it lightly in place. Turn the wooden leg clockwise five more
+      times to tighten it partway. Tighten the wooden leg into the table by
+      twisting it clockwise until tight.
+    atomic_actions:
+      - "Flip the table upside down."
+      - "Place the screw on the hole and screw it in place lightly."
+      - "Pick up the wooden leg and place it on top of the screw and screw it lightly in place."
+      - "Turn the wooden leg clockwise five more times to tighten it partway."
+      - "Tighten the wooden legs into the table by twisting them clockwise until tight."
+
+  - id: LAMPLIG
+    english: stainless steel trivet
+    instruction: >-
+      Pick up the black square and put it to a corner, then press on the
+      black item until it snaps into the metal tray.
+    atomic_actions:
+      - "Pick up the black square and put it on the missing corner."
+      - "Press on the black item until it snaps into the metal tray."
+
+  - id: LANESPELARE
+    english: foldable laptop support
+    instruction: >-
+      Lift up the flap, slide the flap into the stand, and flip the laptop
+      stand upside down.
+    atomic_actions:
+      - "Lift up the flap."
+      - "Slide the flap into the stand."
+      - "Flip the laptop stand upside down."
+
+  - id: PATRULL
+    english: door stop
+    instruction: >-
+      Put the white strap on top of the white square, then press the white
+      strap onto the white square until it clicks.
+    atomic_actions:
+      - "Put the white strap on top of the white square."
+      - "Press the white strap onto the white square until it clicks."
+
+  - id: SKOGSROR
+    english: napkin holder
+    instruction: >-
+      Pick up the green metal piece, fold the left flap upwards, and fold
+      the right flap upwards.
+    atomic_actions:
+      - "Fold the left flap upwards."
+      - "Fold the right flap upwards."
+
+  - id: VARSYREN
+    english: tealight lantern
+    instruction: >-
+      Fold up the left sheet, fold up the right sheet, fold the sheets to
+      form a cylinder, slide the hooks to lock the sheets together, and
+      attach the handle to the lantern.
+    atomic_actions:
+      - "Fold up the left sheet."
+      - "Fold up the right sheet."
+      - "Fold the sheets to form a cylinder."
+      - "Slide the hooks to lock the sheets together."
+      - "Attach the handle to the lantern."

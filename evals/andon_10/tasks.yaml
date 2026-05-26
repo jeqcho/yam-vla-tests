@@ -1,0 +1,27 @@
+name: andon_10
+description: |
+  10-task operator-driven eval — varied bimanual manipulation. Same
+  tasks as the original molmoact2-setup/eval-10-tasks/eval_andon_tasks.py.
+n_attempts_default: 3
+
+tasks:
+  - id: stack_two_orange_blocks
+    instruction: Stack two orange blocks vertically
+  - id: cube_into_tape_roll
+    instruction: Put the orange cube into the tape roll
+  - id: knife_in_box
+    instruction: Put the knife in the box
+  - id: apple_on_plate
+    instruction: Put the apple on the plate
+  - id: stack_three_cups
+    instruction: Stack three cups
+  - id: pen_on_notebook
+    instruction: Place pen on notebook
+  - id: fold_tshirt
+    instruction: Fold this t-shirt
+  - id: close_box_lid
+    instruction: Close the lid of the box
+  - id: rotate_hex_key
+    instruction: Rotate the hex key on the screw one full turn clockwise
+  - id: plug_into_socket
+    instruction: Put the electric plug into the socket
