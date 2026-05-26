@@ -1,6 +1,22 @@
 # MolmoAct2 — AllenAI bimanual YAM finetune.
 # Wire format: HTTP + json_numpy on port 8202.
 # Server source: _archive/molmoact2-setup/molmoact2/examples/yam/host_server_yam.py
+#
+# All defaults below are verified against upstream:
+#   - port 8202        : host_server_yam.py:326 (default=8202)
+#   - image_keys.*     : host_server_yam.py:261-263 payload destructuring
+#   - num_steps 10     : host_server_yam.py:65 (DEFAULT_NUM_STEPS = 10)
+#                        Also confirmed on the AllenAI HF model card text:
+#                        "defaults to the checkpoint config value, 10"
+#   - action_horizon 30: hf-cache/...norm_stats.json:metadata_by_tag.
+#                        yam_dual_molmoact2.action_horizon = 30
+#
+# Server-side defaults you DON'T set here (host_server_yam.py handles them):
+#   enable_cuda_graph=True       (first call slow as CUDA graphs capture)
+#   normalize_language=True      (lowercases + strips trailing punctuation)
+#   enable_depth_reasoning=False (REQUIRED — calling True raises)
+#   norm_tag="yam_dual_molmoact2" (REQUIRED at inference)
+#   inference_action_mode="continuous"  (default, recommended)
 
 policy: molmoact2
 model_id: allenai/MolmoAct2-BimanualYAM
@@ -20,7 +36,7 @@ image_keys:
 options:
   num_steps: 10            # flow-matching solver steps; +N = slower, smoother
 
-# Used by configs/eval/* to set sensible defaults for the control loop.
+# Used by the eval/REPL harnesses to set sensible defaults for the control loop.
 control:
-  action_horizon_hint: 30  # checkpoint default; the actual horizon is on Prediction
+  action_horizon_hint: 30  # number of (14,) action rows per chunk
   horizon_stride_default: 6

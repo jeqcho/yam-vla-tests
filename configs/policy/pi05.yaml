@@ -1,19 +1,47 @@
 # π₀.₅ — jeqcho openpi finetune.
-# Wire format: WebSocket + msgpack via openpi-client on port 8000.
+# Wire format: WebSocket + msgpack via openpi on port 8000.
 # Server source: vendored openpi (see servers/pi05/run.sh).
+#
+# Defaults below are verified against upstream + the YAM training config:
+#   - port             : UPSTREAM default is 8010 (openpi-agilex
+#                        scripts/serve_policy.py:124: port: int = 8010)
+#                        We use 8000 DELIBERATELY — established convention
+#                        in your previous run_server_pi05.sh deployments.
+#                        Override with `PORT=8010 ./servers/pi05/run.sh`.
+#   - image_keys.*     : CANONICAL openpi internal names.
+#                        Verified in 3 upstream places (all agree):
+#                          openpi/models/model.py:40-41
+#                          openpi/models_pytorch/preprocessing_pytorch.py:12-13
+#                          openpi/models/pi0_config.py:84-85
+#                        WARNING: the agilex AlohaInputs fork SILENTLY
+#                        zero-fills any canonical key it doesn't receive.
+#                        Sending cam_high/cam_left_wrist makes the model
+#                        run blind with NO error. Do not change these
+#                        unless the training fork was modified.
+#   - adapt_to_pi=False             : servers/pi05/register_yam_pi05.py:103
+#                                     YAM is NOT Trossen Aloha hardware;
+#                                     True applies wrong joint flips.
+#   - use_delta_joint_actions=False : servers/pi05/register_yam_pi05.py:117
+#                                     Must match the training fork's setting.
+#
+# Action horizon — two numbers, two different meanings:
+#   Pi0Config padded INTERNAL: action_horizon=50, action_dim=32
+#     The model returns its training-pad shape (50, 32) on the wire.
+#   YAM training REAL: action_horizon=16, action_dim=14
+#     The first 16 of those 50 positions are trained outputs;
+#     positions 16-49 are extrapolation past the trained horizon.
+#   The Pi05 backend strips to (:, :14) → (50, 14). We report 16 here
+#   because positions past 16 are model-extrapolation, not trained.
+#   (If you set --horizon-stride > 16, you start playing extrapolation.)
 
 policy: pi05
 model_id: jeqcho/pi05-yam-bimanual
 transport:
   scheme: ws
   host: 127.0.0.1
-  port: 8000
-  # api_key: ${PI05_API_KEY}    # uncomment if you put openpi behind a key
+  port: 8000               # see header: deliberate vs upstream default 8010
+  # api_key: ${PI05_API_KEY}   # uncomment if you put openpi behind a key
 
-# CRITICAL: these are the CANONICAL openpi internal image keys.
-# The agilex AlohaInputs.STANDARD_IMAGE_KEYS list is the authority.
-# Sending cam_high/cam_left_wrist instead = model receives zeros and
-# runs blind (no error, just bad actions).
 image_keys:
   top: base_0_rgb
   left_wrist: left_wrist_0_rgb
@@ -22,9 +50,9 @@ image_keys:
 # yam_pi05 TrainConfig knobs (used by servers/pi05/register_yam_pi05.py,
 # not by the client). Documented here for provenance.
 training_config:
-  adapt_to_pi: false           # YAM is NOT Trossen Aloha — don't flip joints
-  use_delta_joint_actions: false  # training fork's setting
+  adapt_to_pi: false
+  use_delta_joint_actions: false
 
 control:
-  action_horizon_hint: 16
+  action_horizon_hint: 16   # real trained horizon; wire returns padded 50
   horizon_stride_default: 8

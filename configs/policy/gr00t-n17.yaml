@@ -1,26 +1,60 @@
 # GR00T N1.7 — jeqcho YAM finetune of nvidia/GR00T-N1.7-3B.
 # Wire format: ZeroMQ REQ/REP + msgpack-numpy on port 5556.
 # Server source: vendored Isaac-GR00T (see servers/gr00t-n17/run.sh).
+#
+# Defaults below are verified against upstream + the actual checkpoint:
+#   - port             : UPSTREAM default is 5555 (NVIDIA Isaac-GR00T main:
+#                        run_gr00t_server.py: DEFAULT_MODEL_SERVER_PORT = 5555)
+#                        We use 5556 DELIBERATELY to leave 5555 free for the
+#                        vanilla baseline (per legacy run_server_vanilla.sh).
+#                        Override with `PORT=5555 ./servers/gr00t-n17/run.sh`
+#                        if you don't need the baseline coexistence.
+#   - image_keys.*     : checkpoint's experiment_cfg/conf.yaml,
+#                        modality_configs.new_embodiment.video.modality_keys
+#                        Currently: [top, left, right]
+#   - language_key     : same conf.yaml, language.modality_keys
+#                        Currently: annotation.human.task_description
+#   - embodiment_tag   : EmbodimentTag enum NAME (gr00t/data/embodiment_tags.py:126)
+#                        Enum value is "new_embodiment" (lowercase); CLI accepts
+#                        either form.
+#
+# Action horizon — two numbers in the conf.yaml, two different meanings:
+#   model.action_horizon: 40
+#     Training-time lookahead window. Irrelevant to inference shapes.
+#   data.modality_configs.new_embodiment.action.delta_indices: [0..15]
+#     Inference-time output positions = 16 future steps per call.
+#   We report 16 here because that's what Prediction.actions sees on the wire.
+#
+# Diffusion solver step count is baked-in:
+#   model.num_inference_timesteps: 4
+#   Unlike MolmoAct's num_steps, you CANNOT tune this per-call.
+#
+# Action representation (also from conf.yaml action.action_configs):
+#   left_arm:      RELATIVE  (server-side unapply_action converts to absolute)
+#   left_gripper:  ABSOLUTE
+#   right_arm:     RELATIVE  (server-side unapply_action converts to absolute)
+#   right_gripper: ABSOLUTE
+#   The wire output is ALREADY absolute for all 4 streams. Do NOT add state
+#   client-side -- the "double-add 2x dangerous motion" bug.
 
 policy: gr00t-n17
 model_id: jeqcho/gr00t-n17-yam-bimanual
 transport:
   scheme: zmq
   host: 127.0.0.1
-  port: 5556
+  port: 5556                # see header: deliberate vs upstream default 5555
   timeout_ms: 30000
 
-# role -> server video-key. The checkpoint's experiment_cfg/conf.yaml
-# under data.modality_configs.new_embodiment.video.modality_keys is the
-# source of truth — copy from there when finetuning a new checkpoint.
+# role -> server video-key. Source of truth is the checkpoint's
+# experiment_cfg/conf.yaml — copy from there when finetuning anew.
 image_keys:
   top: top
   left_wrist: left
   right_wrist: right
 
 language_key: annotation.human.task_description
-embodiment_tag: NEW_EMBODIMENT
+embodiment_tag: NEW_EMBODIMENT   # enum NAME; value "new_embodiment"
 
 control:
-  action_horizon_hint: 16
+  action_horizon_hint: 16   # INFERENCE output positions, not training-time 40
   horizon_stride_default: 4
