@@ -1,0 +1,8 @@
+hf-cache/
+logs/
+eval-10-tasks/results/
+servers/pi05/openpi/
+__pycache__/
+*.pyc
+.venv/
+.venv-*/
