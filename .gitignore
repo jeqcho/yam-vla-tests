@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-*/
+build/
+dist/
+
+# uv / pip
+.python-version
+
+# HF caches / model weights
+hf-cache/
+*.safetensors
+*.bin
+*.gguf
+
+# logs + recordings
+logs/
+*.rrd
+*.log
+
+# eval results
+evals/**/results/
+
+# vendored upstream clones (gitignored to keep size sane)
+vendored/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
