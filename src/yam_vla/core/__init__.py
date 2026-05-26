@@ -12,6 +12,11 @@ from yam_vla.core.observation import (
 )
 from yam_vla.core.policy import Policy, Prediction, ServerInfo
 from yam_vla.core.config import PolicyConfig
+from yam_vla.core.runner import (
+    AsyncPolicyInference,
+    AttemptStats,
+    build_observation,
+)
 
 __all__ = [
     "ImageRole",
@@ -21,6 +26,9 @@ __all__ = [
     "Prediction",
     "ServerInfo",
     "PolicyConfig",
+    "AsyncPolicyInference",
+    "AttemptStats",
+    "build_observation",
     "STATE_DIM",
     "ARM_DOF",
     "LEFT_ARM",
