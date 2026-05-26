@@ -16,34 +16,82 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 
-# Reuse the existing Isaac-GR00T clone (still under _archive/ post-refactor).
-DEFAULT_GR00T_DIR="$REPO_ROOT/_archive/grootn1.7-exploration/Isaac-GR00T"
-GR00T_DIR="${GR00T_DIR:-$DEFAULT_GR00T_DIR}"
-if [[ ! -d "$GR00T_DIR" ]]; then
-    echo "Isaac-GR00T clone not found at $GR00T_DIR" >&2
-    echo "  Either clone+sync it there, or set GR00T_DIR=/abs/path" >&2
+# Resolution order for the Isaac-GR00T clone (the 15 GB venv plus the
+# upstream repo). The consolidation typically skips heavy clones, so
+# the actual install usually still lives at the original location. Note
+# that original folder name contains a SPACE.
+_GR00T_CANDIDATES=(
+    "${GR00T_DIR:-}"
+    "$REPO_ROOT/_archive/grootn1.7-exploration/Isaac-GR00T"
+    "$HOME/yam-tests/grootn1.7 exploration/Isaac-GR00T"
+)
+GR00T_DIR=""
+for cand in "${_GR00T_CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    if [[ -d "$cand" && -x "$cand/.venv/bin/python" ]]; then
+        GR00T_DIR="$cand"
+        break
+    fi
+done
+if [[ -z "$GR00T_DIR" ]]; then
+    echo "Could not find a valid Isaac-GR00T clone (with .venv/)." >&2
+    echo "  Tried:" >&2
+    for cand in "${_GR00T_CANDIDATES[@]}"; do
+        [[ -n "$cand" ]] && echo "    $cand" >&2
+    done
+    echo "  Either clone+sync it, or set GR00T_DIR=/abs/path." >&2
     exit 1
 fi
-if [[ ! -x "$GR00T_DIR/.venv/bin/python" ]]; then
-    echo "Isaac-GR00T venv missing at $GR00T_DIR/.venv/" >&2
-    echo "  Run: cd \"$GR00T_DIR\" && uv sync --all-extras" >&2
-    exit 1
-fi
+echo "[servers/gr00t-n17] GR00T_DIR=$GR00T_DIR" >&2
 
-CKPT_DIR="${CKPT_DIR:-$REPO_ROOT/hf-cache/checkpoints/jeqcho_gr00t-n17-yam-bimanual}"
-if [[ ! -d "$CKPT_DIR" ]]; then
-    echo "Checkpoint dir not found: $CKPT_DIR" >&2
+# Same fallback chain for the checkpoint: the canonical hf-cache lives
+# next to whichever Isaac-GR00T install was active when the checkpoint
+# was downloaded.
+_CKPT_CANDIDATES=(
+    "${CKPT_DIR:-}"
+    "$REPO_ROOT/hf-cache/checkpoints/jeqcho_gr00t-n17-yam-bimanual"
+    "$HOME/yam-tests/eval-yam/hf-cache/checkpoints/jeqcho_gr00t-n17-yam-bimanual"
+    "$HOME/yam-tests/grootn1.7 exploration/hf-cache/checkpoints/jeqcho_gr00t-n17-yam-bimanual"
+)
+CKPT_DIR=""
+for cand in "${_CKPT_CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    if [[ -d "$cand" ]]; then
+        CKPT_DIR="$cand"
+        break
+    fi
+done
+if [[ -z "$CKPT_DIR" ]]; then
+    echo "Could not find the gr00t-n17 checkpoint directory." >&2
+    echo "  Tried:" >&2
+    for cand in "${_CKPT_CANDIDATES[@]}"; do
+        [[ -n "$cand" ]] && echo "    $cand" >&2
+    done
     echo "  Run: $REPO_ROOT/scripts/download_checkpoints.sh gr00t-n17" >&2
     exit 1
 fi
+echo "[servers/gr00t-n17] CKPT_DIR=$CKPT_DIR" >&2
 
 PORT="${PORT:-5556}"
 DEVICE="${DEVICE:-cuda:0}"
 
-# Cosmos blobs are cached in the original grootn1.7-exploration HF cache.
-# Detect; force offline mode if found, so transformers doesn't 401 on the
-# gated repo even without a fresh `hf auth login`.
-DEFAULT_HF_HOME="$REPO_ROOT/_archive/grootn1.7-exploration/hf-cache"
+# Find the HF cache holding the Cosmos backbone (gated repo — needed
+# at policy-load time). Same fallback chain as the Isaac-GR00T clone.
+_HFCACHE_CANDIDATES=(
+    "${HF_HOME:-}"
+    "$REPO_ROOT/_archive/grootn1.7-exploration/hf-cache"
+    "$HOME/yam-tests/grootn1.7 exploration/hf-cache"
+)
+DEFAULT_HF_HOME=""
+for cand in "${_HFCACHE_CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    if [[ -d "$cand" ]]; then
+        DEFAULT_HF_HOME="$cand"
+        break
+    fi
+done
+DEFAULT_HF_HOME="${DEFAULT_HF_HOME:-$REPO_ROOT/_archive/grootn1.7-exploration/hf-cache}"
+
 COSMOS_CACHED=0
 if [[ -d "$DEFAULT_HF_HOME/models--nvidia--Cosmos-Reason2-2B" ]] \
 || [[ -d "$DEFAULT_HF_HOME/hub/models--nvidia--Cosmos-Reason2-2B" ]]; then
@@ -53,6 +101,7 @@ export HF_HOME="${HF_HOME:-$DEFAULT_HF_HOME}"
 export TRANSFORMERS_CACHE="$HF_HOME"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 mkdir -p "$HF_HOME"
+echo "[servers/gr00t-n17] HF_HOME=$HF_HOME" >&2
 
 if [[ "$COSMOS_CACHED" == "1" && -z "${HF_HUB_OFFLINE:-}" ]]; then
     echo "[servers/gr00t-n17] Cosmos blobs cached at $HF_HOME -- forcing HF_HUB_OFFLINE=1"

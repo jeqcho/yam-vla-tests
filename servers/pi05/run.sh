@@ -35,16 +35,50 @@ if [[ ! -x "$OPENPI_DIR/.venv/bin/python" ]]; then
     exit 1
 fi
 
-CKPT_DIR="${CKPT_DIR:-$REPO_ROOT/hf-cache/checkpoints/jeqcho_pi05-yam-bimanual}"
-if [[ ! -d "$CKPT_DIR" ]]; then
-    echo "Checkpoint dir not found: $CKPT_DIR" >&2
+# Pi-0.5 checkpoint fallback chain. The consolidation typically skips
+# the multi-GB hf-cache, so the checkpoint usually still lives at the
+# original eval-yam location.
+_CKPT_CANDIDATES=(
+    "${CKPT_DIR:-}"
+    "$REPO_ROOT/hf-cache/checkpoints/jeqcho_pi05-yam-bimanual"
+    "$HOME/yam-tests/eval-yam/hf-cache/checkpoints/jeqcho_pi05-yam-bimanual"
+)
+CKPT_DIR=""
+for cand in "${_CKPT_CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    if [[ -d "$cand" ]]; then
+        CKPT_DIR="$cand"
+        break
+    fi
+done
+if [[ -z "$CKPT_DIR" ]]; then
+    echo "Could not find the pi-0.5 checkpoint directory." >&2
+    echo "  Tried:" >&2
+    for cand in "${_CKPT_CANDIDATES[@]}"; do
+        [[ -n "$cand" ]] && echo "    $cand" >&2
+    done
     echo "  Run: $REPO_ROOT/scripts/download_checkpoints.sh pi05" >&2
     exit 1
 fi
+echo "[servers/pi05] CKPT_DIR=$CKPT_DIR" >&2
 
 PORT="${PORT:-8000}"
 
-export HF_HOME="${HF_HOME:-$REPO_ROOT/hf-cache}"
+# HF_HOME follows the same fallback as the checkpoint (sibling dirs).
+_HFHOME_CANDIDATES=(
+    "${HF_HOME:-}"
+    "$REPO_ROOT/hf-cache"
+    "$HOME/yam-tests/eval-yam/hf-cache"
+)
+_RESOLVED_HF=""
+for cand in "${_HFHOME_CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    if [[ -d "$cand" ]]; then
+        _RESOLVED_HF="$cand"
+        break
+    fi
+done
+export HF_HOME="${_RESOLVED_HF:-$REPO_ROOT/hf-cache}"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 mkdir -p "$HF_HOME"
 
