@@ -235,15 +235,72 @@ class RealSenseStream(CameraStream):
                  self.name, self.serial, self.width, self.height, self.fps, got)
 
     def grab(self) -> np.ndarray:
+        # Two-attempt grab: a clean retry on transient timeouts AND a
+        # full pipeline restart on librealsense state corruption. The
+        # latter happens when wait_for_frames hits a hard error and
+        # the underlying pipeline gets implicitly stopped; subsequent
+        # calls raise "cannot be called before start()". We've seen
+        # this with marginal USB-3 contacts on D405 (camera 352122...).
         try:
             frames = self.pipeline.wait_for_frames(timeout_ms=2000)
-        except RuntimeError:
-            log.warning("camera %s (%s): grab timeout, retrying once", self.name, self.serial)
-            frames = self.pipeline.wait_for_frames(timeout_ms=3000)
+        except RuntimeError as e1:
+            log.warning("camera %s (%s): grab timeout (%s); restarting pipeline",
+                        self.name, self.serial, e1)
+            self._restart_pipeline()
+            try:
+                frames = self.pipeline.wait_for_frames(timeout_ms=3000)
+            except RuntimeError as e2:
+                raise RuntimeError(
+                    f"camera {self.name} ({self.serial}) grab failed after "
+                    f"pipeline restart: {e2}. Physically replug the USB-C "
+                    f"cable and re-run list_cams.py to verify USB 3 link."
+                ) from e2
         color = frames.get_color_frame()
         if not color:
             raise RuntimeError(f"camera {self.name} produced no color frame")
         return np.asanyarray(color.get_data())
+
+    def _restart_pipeline(self) -> None:
+        """Tear down and re-establish the RealSense pipeline. Used
+        when grab() detects a state-corrupted pipeline. Re-runs USB
+        SuperSpeed negotiation as a side effect (it's a brand-new
+        rs.pipeline() instance, not a restart-in-place).
+
+        Uses a shorter warmup budget (5 s vs the 20 s on first start)
+        because we're recovering mid-rollout and can't afford a long
+        stall. If the camera can't produce 3 frames in 5 s, it's
+        almost certainly a hardware issue the operator needs to fix.
+        """
+        import pyrealsense2 as rs
+        try:
+            self.pipeline.stop()
+        except RuntimeError:
+            # Pipeline was already stopped (the corruption case) -- expected.
+            pass
+        # Brief settle so the USB layer can re-arbitrate.
+        time.sleep(0.2)
+        cfg = rs.config()
+        cfg.enable_device(self.serial)
+        cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
+        self.pipeline = rs.pipeline()
+        self.pipeline.start(cfg)
+        budget_s = 5.0
+        deadline = time.monotonic() + budget_s
+        got = 0
+        while got < 3 and time.monotonic() < deadline:
+            try:
+                self.pipeline.wait_for_frames(timeout_ms=1000)
+                got += 1
+            except Exception:
+                pass
+        if got == 0:
+            raise RuntimeError(
+                f"camera {self.name} ({self.serial}) produced no frames "
+                f"within {budget_s:.0f}s after restart -- USB link is dead. "
+                f"Physically replug and re-run list_cams.py."
+            )
+        log.info("camera %s (%s) pipeline restarted (warmup %d frames)",
+                 self.name, self.serial, got)
 
     def stop(self) -> None:
         if self.pipeline is not None:
