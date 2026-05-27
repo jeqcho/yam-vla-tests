@@ -16,14 +16,16 @@ Concrete examples:
 
 What it does:
     1. Bring up cameras + arms (same as run_eval.py)
-    2. Show a prompt loop:
+    2. Ramp arms to the policy's canonical ready pose (in-distribution
+       joint configuration; preserves current gripper opening)
+    3. Show a prompt loop:
          > pick up the orange cube
-         [running... press Enter to stop]
+         [running... press → or Enter to stop]
          ...arms move...
          > stack two blocks
          [running...]
          > /quit
-    3. Each instruction runs ONE attempt via the same core.run_attempt
+    4. Each instruction runs ONE attempt via the same core.run_attempt
        loop the eval harness uses -- you get the same safety, telemetry,
        and Rerun .rrd recording for free.
 
@@ -63,25 +65,9 @@ from yam_vla.core import (
 )
 
 
-class _EnterStopWatcher:
-    """Hit Enter to stop the running attempt."""
-    def __init__(self):
-        self._stopped = False
-        self._thread = None
-
-    def start(self) -> None:
-        import threading
-        def _wait():
-            try:
-                input()
-            except (EOFError, KeyboardInterrupt):
-                pass
-            self._stopped = True
-        self._thread = threading.Thread(target=_wait, daemon=True)
-        self._thread.start()
-
-    def predicate(self):
-        return lambda: self._stopped
+# Operator-UX helpers (→ / Enter early-stop, log silencing) live in
+# yam_vla.core.keyboard so the eval harness and REPL stay in lockstep.
+from yam_vla.core.keyboard import AdvanceWatcher, silence_root_logger
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -132,6 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s | %(message)s")
+    # Cap i2rt's noisy root-logger INFO output (Grav Comp Frequency / Total
+    # rate heartbeats) so it can't garble the operator's typed instructions.
+    silence_root_logger()
     log = logging.getLogger("yam_vla.repl")
 
     args = build_parser().parse_args()
@@ -143,6 +132,11 @@ def main() -> None:
     cfg = PolicyConfig.from_path(policy_yaml)
     if args.horizon_stride is None:
         args.horizon_stride = int(cfg.control.get("horizon_stride_default", 6))
+    # Canonical "ready pose" the arms ramp to once after init. See the
+    # policy YAML's control.ready_pose for derivation. Optional -- if
+    # absent, arms simply hold their post-init pose (legacy behavior).
+    ready_pose_cfg = cfg.control.get("ready_pose")
+    ready_pose_ramp_s = float(cfg.control.get("ready_pose_ramp_duration_s", 5.0))
     policy = cfg.build()
     setup_cfg = load_setup_config()
 
@@ -189,6 +183,24 @@ def main() -> None:
             np.asarray(left.get_joint_pos(),  dtype=np.float32),
             np.asarray(right.get_joint_pos(), dtype=np.float32),
         ])
+
+        # Ramp arms to the policy's canonical ready pose so every typed
+        # instruction starts from an in-distribution joint configuration
+        # (the centroid of training-action means). Gripper indices are
+        # preserved from current state so we don't slam-close on what's
+        # held. No ramp if the policy YAML doesn't declare one.
+        if ready_pose_cfg is not None:
+            rp = np.asarray(ready_pose_cfg, dtype=np.float32)
+            if rp.shape != (14,):
+                log.warning("ready_pose has shape %s, expected (14,); skipping ramp",
+                            rp.shape)
+            else:
+                rp[6]  = startup_pose[6]
+                rp[13] = startup_pose[13]
+                log.info("Ramping to canonical ready pose (%.1fs)...", ready_pose_ramp_s)
+                ramp_to_pose(left, right, rp,
+                             duration_s=ready_pose_ramp_s,
+                             label="initial move-to-ready")
 
         # Prompt loop
         print("\n" + "=" * 70, flush=True)
@@ -238,16 +250,22 @@ def main() -> None:
                 dry_run=args.dry_run,
                 policy_opts={"num_steps": args.num_steps},
             )
-            watcher = _EnterStopWatcher()
+            watcher = AdvanceWatcher()
             watcher.start()
-            print(f"[attempt] running. press Enter to stop early.", flush=True)
-            last_stats = run_attempt(
-                policy=policy, knobs=knobs,
-                top_cam=top, left_cam=cam_l, right_cam=cam_r,
-                left_arm=left, right_arm=right,
-                rerun=rerun,
-                stop=watcher.predicate(),
-            )
+            print(f"[attempt] running. press → or Enter to stop early.", flush=True)
+            try:
+                last_stats = run_attempt(
+                    policy=policy, knobs=knobs,
+                    top_cam=top, left_cam=cam_l, right_cam=cam_r,
+                    left_arm=left, right_arm=right,
+                    rerun=rerun,
+                    stop=watcher.predicate(),
+                )
+            finally:
+                # Restore cooked stdin BEFORE the next `input("> ")` so
+                # the operator's typed characters aren't eaten by the
+                # background raw-mode watcher.
+                watcher.stop()
             print(f"[attempt done] chunks={last_stats.chunks} "
                   f"duration={last_stats.duration_s:.1f}s "
                   f"rtt_mean={last_stats.rtt_ms_mean:.0f}ms "
