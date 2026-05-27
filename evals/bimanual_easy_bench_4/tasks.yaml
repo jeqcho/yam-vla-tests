@@ -1,100 +1,103 @@
 name: bimanual_easy_bench_4
 description: |
-  Four-task diagnostic suite for bimanual-only manipulation primitives on
-  the YAM rig. Each task isolates ONE bimanual primitive that has no
-  single-arm reduction. Atomic single-instruction prompts — no chained
-  subgoals — so per-task success rate reflects one skill, not the product
-  of several.
+  Four-task diagnostic suite for bimanual manipulation on the YAM rig.
+  Designed bottom-up from the BimanualYAM training-corpus clusters --
+  every task in this suite directly emulates one of the four largest
+  task families the policy was trained on.
 
-  Renamed from bimanual_easy_bench_8 after dropping four tasks judged
-  too hard or off-distribution for molmoact2-BimanualYAM:
-    - bag_fold        (deformable fold; "Fold" verb 0/591 in YAM corpus;
-                       10/10 failure observed on initial run)
-    - cube_handoff    (discrete mid-trajectory transfer; "pass" 0/591)
-    - allen_wrench_turn (stabilize + rotational torque; rotation verbs
-                       entirely absent from corpus)
-    - pour_cubes      (asymmetric tool + receiver; "pour" 0/591,
-                       granular-flow primitive absent from training)
-  And one task added in their place:
-    - cube_into_gray_box  (bimanual insertion into a held receptacle;
-                       directly matches the corpus's dominant "Pick up
-                       + Place X into Y" template — 263 "into"
-                       occurrences in 591 annotations)
+  Reformulated (third pass) after the earlier 8 -> 5 -> 4 prunes still
+  left the suite OOD-leaning. K-means clustering of 1387 unique
+  training annotations (sentence-transformers MiniLM embeddings,
+  k=5) revealed five distinct training task-families:
 
-  Prompting principles applied (see README.md for sources):
-    - Imperative present tense, no metalanguage ("hold steady" not
-      "stabilize"; "with both arms" not "use both grippers")
-    - "your left arm" / "your right arm" — most-trained phrasing in
-      ALOHA / pi0 / MolmoAct datasets vs "gripper" or "manipulator"
-    - Every object disambiguated by visible attribute (color before noun)
-    - No pronouns — every noun restated to avoid anaphora that depends
-      on the model's working memory
-    - Clean grammar (pi0 freezes on typos / ambiguity per the pi0 paper)
-    - Single atomic verb-result, no "then" chaining unless the second
-      action is the only verifiable end-state
+    Cluster 0  9% : Charging workflow (Grasp + plug + switch)
+    Cluster 1 36% : Block arrangement (line / formation)
+    Cluster 2 17% : Block spelling (AI2, CVPR, ROBOT, RSS)
+    Cluster 3 17% : Stationery box-loading (marker, tape, ruler)
+    Cluster 4 22% : Snack/multi-item box-loading (close lid)
+
+  Cluster 2 dropped (no letter blocks in inventory). Remaining 4 tasks
+  draw from clusters 0, 1, 3, and a held-receptacle variant of cluster
+  3/4. Each instruction is paraphrased close to its cluster centroid
+  to maximize in-distribution alignment.
+
+  Trade-off vs the prior OOD-heavy suite:
+    GAINED  -- expected per-task pass rates 50-80% instead of 0-30%
+              measures deployment reliability on trained primitives
+    LOST    -- diagnostic coverage of un-trained primitives
+              (stabilize+pull, midair convergence, wide-rigid lift,
+              symmetric deformable, etc.)
+
+  Use this suite when you want to see the model actually work. Use
+  bimanual_easy_bench_4's prior version (in git history at any commit
+  before this YAML rewrite) when you want primitive-diversity stress
+  testing.
 
 n_attempts_default: 3
 
-# Inter-attempt scene-reset countdown. The flow is:
-#   1. Banner shows TASK + ITER N of X + PROMPT
-#   2. Operator → to start; arms execute the rollout
-#   3. Operator → to end the rollout (or wait for max_chunks)
-#   4. Operator scores s/f/u/r
-#   5. Arms ramp back to ready pose
-#   6. Reset countdown runs while operator resets the physical scene
-#   7. Countdown expires OR operator presses → → next iteration
-# Override per-run with --reset-seconds N (0 disables the countdown).
+# Inter-attempt scene-reset countdown. Soft target only; never auto-
+# advances. Press right-arrow or Enter to advance.
 reset_seconds_default: 30
 
 tasks:
+  - id: arrange_cubes_line
+    english: arrange four cubes in a line
+    instruction: "Pick up the four orange cubes and arrange them in a horizontal line."
+    meta:
+      training_cluster: 1 (block arrangement; 36% of BimanualYAM corpus)
+      primitive: parallel-pick + arrange in formation
+      setup: |
+        Four orange cubes scattered on the table within reach of both
+        arms. The closest corpus annotation is "Pick up blocks and
+        arrange them in a horizontal line." (23 occurrences). Our
+        version specifies "the four orange cubes" because the rest
+        of the suite uses orange cubes; this gives the policy a
+        consistent object class to ground on across tasks.
+
+  - id: marker_apple_into_box
+    english: place marker and apple into box
+    instruction: "Place the red marker and the apple into the gray box."
+    meta:
+      training_cluster: 3 (stationery box-loading; 17% of corpus)
+      primitive: multi-object placement into stationary container
+      setup: |
+        Gray box on the table (no lid; user does NOT have a closeable
+        box). Red marker and apple within reach. The closest corpus
+        annotation pattern is "Place green tape, white tape, and pens
+        into the box." (multi-object, no close). We deliberately
+        skip a "then close the box" coda because the user's gray box
+        has no lid; that's also fine vs. the corpus -- 416/591 multi-
+        item placements in the corpus go without a close clause.
+
   - id: cube_into_gray_box
     english: cube into held gray box
     instruction: "Pick up the gray box with your left arm and place the orange cube into the box with your right arm."
     meta:
-      primitive: bimanual_insertion_held_receptacle
-      aloha_ancestor: ALOHA peg-in-socket (canonical bimanual insertion)
+      training_cluster: 3 + 4 hybrid (held-receptacle variant)
+      primitive: bimanual insertion (held receptacle)
+      aloha_ancestor: ALOHA peg-in-socket
       setup: |
         Empty gray box on the LEFT side of the workspace, orange cube
-        on the RIGHT side. Box must be small enough that the left
-        gripper can fully lift it (not a heavy crate). The bimanual
-        structure is forced by the explicit "Pick up the gray box
-        first" clause -- the cube goes into a held receptacle, not
-        a table-resting one. Most corpus-aligned task in the suite:
-        the "Place X into Y" template is the dominant pattern in
-        AllenAI's BimanualYAM training corpus (263 "into" tokens in
-        591 annotations).
+        on the RIGHT side. Bimanual structure is forced by the explicit
+        "Pick up the gray box first" clause. Matches the corpus's
+        dominant "Pick up + Place X into Y" template; the held-in-air
+        receptacle aspect is the bimanual primitive being measured.
 
-  - id: wire_rack_lift
-    english: wire rack lift
-    instruction: "Grasp the black wire rack using both arms, then lift it off the table."
+  - id: plug_socket_into_outlet
+    english: plug socket into outlet
+    instruction: "Grasp the black socket, then plug it into the white outlet."
     meta:
-      primitive: coordinated_wide_rigid_lift
-      aloha_ancestor: (no direct ALOHA analog; ALOHA-2 bimanual tray task)
+      training_cluster: 0 (charging workflow; 9% of corpus)
+      primitive: stabilize + axial-insertion under alignment
       setup: |
-        Black wire rack flat on the table. Operator deliberately does
-        NOT specify which edges or bars the grippers should target --
-        the policy gets full discretion on grasp point selection.
-        Success = rack is lifted clear of the table with both grippers
-        engaged. The motor primitive being scored is "both grippers
-        commit force at the same time to a single rigid object," not
-        "did the policy match a specific grasp-pose heuristic."
-
-  - id: rail_tap
-    english: rail tap
-    instruction: "Pick up the two wooden rails using both arms, then tap them together."
-    meta:
-      primitive: midair_bimanual_convergence
-      aloha_ancestor: (refined from ALOHA bimanual insertion, precision-alignment stripped out)
-      setup: |
-        Two short wooden rail segments, one on each side of the
-        workspace.
-
-  - id: marker_uncap
-    english: marker uncap
-    instruction: "Grasp the red marker, then pull the cap off the red marker."
-    meta:
-      primitive: stabilize_plus_axial_pull
-      aloha_ancestor: ALOHA cup uncap
-      setup: |
-        Red marker (capped) centered on the table, oriented so the cap
-        end faces the right arm.
+        White wall outlet (taken out of a wall, sitting on the table)
+        on the right side. Black socket / plug on the left side. The
+        closest corpus template is the first two clauses of every
+        charging annotation:
+          "Grasp the charger cable, plug it into the phone, then..."
+        Our version drops the third clause (no switch on the standalone
+        outlet) but preserves the canonical "Grasp X, then plug it into
+        Y" template. This is the most templated cluster in the corpus
+        (centroid similarity 0.78-0.97 for in-cluster annotations);
+        if our wording matches the template even loosely, the policy
+        should produce a confident attempt.

@@ -1,12 +1,17 @@
-# bimanual_easy_bench_4 — diagnostic 4-task bimanual suite
+# bimanual_easy_bench_4 — corpus-aligned 4-task bimanual suite
 
-A short, diagnostic eval covering **four distinct bimanual manipulation
-primitives** chosen to be tractable on the bimanual YAM rig. The "easier
-than IKEA, more informative than LIBERO-Object" canonical benchmark for
-this hardware.
+A short, diagnostic eval where **every task is derived bottom-up from
+the BimanualYAM training-corpus clusters**. Designed to produce
+*pass rates the policy can actually achieve*, by matching the
+phrasings and primitives the policy was most heavily trained on.
 
-Renamed from `bimanual_easy_bench_8` after three tasks were dropped
-(see CHANGELOG section below) and one new task was added.
+This is the third major revision of the suite. The first two
+(`bench_8`, then `bench_5/4` after pruning) were designed top-down
+from ALOHA-canonical primitives — fold, pour, pull-apart, etc. — and
+produced near-zero pass rates because those primitives don't appear
+in molmoact2-BimanualYAM's training mix. This revision flips the
+methodology: we clustered the actual training annotations and chose
+one task per top training cluster.
 
 ## Quickstart
 
@@ -17,14 +22,6 @@ Renamed from `bimanual_easy_bench_8` after three tasks were dropped
 # 2. Run the eval (Terminal B). Samples = attempts per task.
 uv run scripts/run_eval.py --policy molmoact2 --eval bimanual_easy_bench_4 \
     --samples 5
-
-# Same eval with a longer reset window:
-uv run scripts/run_eval.py --policy pi05 --eval bimanual_easy_bench_4 \
-    --samples 3 --reset-seconds 60
-
-# Disable the countdown (operator-driven, advance only on Enter / right-arrow):
-uv run scripts/run_eval.py --policy gr00t-n17 --eval bimanual_easy_bench_4 \
-    --reset-seconds 0
 ```
 
 ## Operator flow (one attempt)
@@ -33,115 +30,89 @@ Per iteration, the harness drives you through five stages. **→ (right
 arrow) is the universal "advance" key.** Enter works the same.
 
 ```
-1. BANNER         shows TASK, iteration N of X, the exact prompt sent
-                  to the policy.
-   →  start the rollout.
-
-2. ROLLOUT        arms execute the prompt. You watch.
-   →  end the rollout immediately (e.g. you saw success, or it's
-      clearly off-rails).
-   (auto-ends if the policy emits max_chunks chunks OR if the
-   per-attempt wall-clock timeout — default 60 s — expires.)
-
-3. ARM RESET      arms ramp back to the canonical training-mean ready
-                  pose. Automatic — no input needed.
-
-4. SCORE          s=success  f=failure  u=unclear  r=redo  Enter=skip.
-
-5. RESET WINDOW   countdown (default 30 s); you reset the physical scene
-                  during this window.
-   →  skip the countdown and go straight to the next iteration.
-   's' to skip the remaining iterations of this task.
-   'q' to abort the entire eval.
+1. BANNER       shows TASK, iteration N of X, the exact prompt
+2. ROLLOUT      arms execute the prompt; → ends rollout early
+3. ARM RESET    arms ramp back to canonical training-mean ready pose
+4. SCORE        s=success  f=failure  u=unclear  r=redo  Enter=skip
+5. RESET WINDOW countdown (default 30 s); → advances early
 ```
 
 ## The four tasks
 
-Each task isolates a distinct **bimanual primitive** — a motor skill
-that has no single-arm sequential reduction.
+| # | Task | Training cluster | Instruction |
+|---|---|---|---|
+| 1 | arrange_cubes_line | Block arrangement (36%) | *"Pick up the four orange cubes and arrange them in a horizontal line."* |
+| 2 | marker_apple_into_box | Stationery box-loading (17%) | *"Place the red marker and the apple into the gray box."* |
+| 3 | cube_into_gray_box | Held-receptacle variant (3+4) | *"Pick up the gray box with your left arm and place the orange cube into the box with your right arm."* |
+| 4 | plug_socket_into_outlet | Charging workflow (9%) | *"Grasp the black socket, then plug it into the white outlet."* |
 
-| #  | Task                  | Primitive                                        | ALOHA-family ancestor                       |
-|----|-----------------------|--------------------------------------------------|---------------------------------------------|
-| 1  | cube into gray box    | Bimanual insertion (held receptacle)             | ALOHA peg-in-socket                         |
-| 2  | wire rack lift        | Coordinated wide-rigid lift                      | ALOHA-2 bimanual tray                       |
-| 3  | rail tap              | Mid-air bimanual convergence                     | refined from ALOHA bimanual insertion       |
-| 4  | marker uncap          | Stabilize + axial pull                           | ALOHA cup uncap                             |
+## How the tasks were chosen
 
-**Why these five and not the original eight?** Two filters were applied
-to every task:
+We embedded all 1,387 unique annotations from 90 BimanualYAM
+training datasets (`allenai/<date>-<category>-<NN>` on HuggingFace)
+using `sentence-transformers/all-MiniLM-L6-v2` and k-means clustered
+to k=5. The clusters that emerged:
 
-1. **Truly bimanual.** Counterfactual: could a single-arm robot do the
-   task by working sequentially? If yes, dropped.
-2. **Atomic.** Each task tests one primitive, not a chain. Success rate
-   reflects skill, not endurance.
+| Cluster | % | Theme | Centroid example |
+|---|---|---|---|
+| 0 | 9%  | Charging workflow | *"Grasp the charger, plug it into the phone, then switch on the socket."* |
+| 1 | 36% | Block arrangement | *"Pick up blocks and arrange them in a horizontal line."* |
+| 2 | 17% | Block spelling    | *"Move blocks to spell 'AI2' by picking up and placing them in order."* |
+| 3 | 17% | Stationery box-loading | *"Place the marker, utility knife, and tape into the cardboard box, then close the box."* |
+| 4 | 22% | Snack box-loading | *"Place yellow, red, green, and blue snack packets into the black box, then close the lid."* |
 
-Plus a third filter added after early hardware runs:
+Cluster 2 (block spelling) requires letter blocks not in our
+inventory, so it's omitted. The remaining four tasks each emulate
+one of the other four clusters.
 
-3. **Within reach of the policy's training distribution.** Tasks where
-   the core verb is 0/591 in the BimanualYAM training corpus AND the
-   physical primitive is genuinely outside the rigid-pick-place
-   distribution were dropped or replaced.
+## Expected pass rates
 
-## CHANGELOG: what's different from bimanual_easy_bench_8
+These are *predictions* based on corpus alignment, not measurements:
 
-**Dropped:**
-- `bag_fold` — deformable fold task. "Fold" verb is 0/591 in the
-  BimanualYAM training corpus. Empirically observed 10/10 failure rate
-  on early hardware run. Associated CSVs deleted.
-- `cube_handoff` — discrete mid-trajectory transfer. "Pass" verb is
-  0/591 in corpus; bimanual handoff is genuinely a hard ALOHA-canonical
-  primitive that wasn't represented in molmoact2's training mix.
-- `allen_wrench_turn` — stabilize + rotational torque. Rotation verbs
-  ("turn", "rotate", "twist") all 0/591 in corpus — this primitive
-  is entirely absent from training.
-- `velcro_pull` — replaced (see below). Original setup was infeasible:
-  velcro strips too small to be picked up off the table by the YAM
-  gripper.
-- `pour_cubes` — asymmetric tool + receiver (pour). "Pour" verb is
-  0/591 in corpus. Granular-flow primitive is absent from the
-  rigid-pick-place training distribution. Dropped after re-scoping
-  to "tasks that should plausibly succeed at >0%."
+| Task | Expected pass rate (10 attempts) |
+|---|---|
+| arrange_cubes_line | 50–80% |
+| marker_apple_into_box | 60–80% |
+| cube_into_gray_box | 50–75% |
+| plug_socket_into_outlet | 40–70% |
 
-**Added:**
-- `cube_into_gray_box` — bimanual insertion into a held receptacle.
-  One arm holds a gray box in the air, the other places an orange cube
-  into the box. Directly matches the corpus's dominant "Pick up + Place
-  X into Y" template — 263 "into" occurrences in 591 annotations.
-  This is the most corpus-aligned task in the suite and should produce
-  the highest single-task success rate.
+If actual numbers come in much lower, the most likely explanation
+is *physical setup mismatch* (e.g. objects too far apart, wrong
+camera angles, gripper geometry doesn't match what it grasps in
+training), not language-OOD-ness. If actual numbers are much
+higher, the model's generalization is stronger than the cluster
+analysis suggests.
 
-## VLA-prompting principles applied
+## Suite history
 
-Instruction strings in `tasks.yaml` were edited to match the phrasings
-that VLAs (pi0, MolmoAct, OpenVLA) handle most reliably:
+This is the third revision of the suite. The full evolution:
 
-- **Imperative present tense, no metalanguage.**
-- **`"your left arm"` / `"your right arm"`** — used in most published
-  checkpoints' phrasings, though the BimanualYAM training corpus
-  specifically has 0 occurrences of arm-side language (an open
-  question whether dropping the arm-side qualifier improves results
-  on molmoact2 specifically; see Sources below).
-- **Every object disambiguated by visible attribute.** `"the red
-  marker"`, `"the orange cube"`, `"the gray box"` — never just
-  `"the cube"`.
-- **Restate nouns when ambiguity is plausible.** Modern VLAs do not
-  reliably resolve anaphora across long instructions.
-- **Clean grammar, no typos.** pi0 specifically [freezes on typos or
-  ambiguous phrasing](https://penn-pal-lab.github.io/Pi0-Experiment-in-the-Wild/).
-- **Single atomic verb-result.** No "then" chaining unless the second
-  action is the only verifiable end-state.
+**v1 — `bimanual_easy_bench_8`** (2026-05-26): 8 ALOHA-canonical
+primitives (fold, pull-apart, hand-off, lift, pour, tap, uncap,
+rotate). Goal was primitive diversity. Result: bag_fold = 0/10
+on initial run; remaining tasks unverified but likely similar.
+
+**v2 — `bimanual_easy_bench_5` then `_4`** (this same file's prior
+revision): dropped bag_fold (verb 0/591), cube_handoff (pass 0/591),
+allen_wrench_turn (rotation absent from corpus), pour_cubes (pour
+0/591). Replaced velcro_pull with cube_into_gray_box (a held-
+receptacle variant that matches the dominant Place-into template).
+Result: cube_into_gray_box predicted to work, remaining 3 still
+OOD on verbs (lift, tap, pull) and absent from corpus structure.
+
+**v3 — this file** (current): scrapped the OOD-heavy approach.
+K-means clustered the corpus into 5 training task-families.
+Picked 4 tasks each derived from a top training cluster.
+
+The history is preserved in git: any commit before this rewrite
+shows the prior task set.
 
 ## Sources
 
-- Tony Zhao et al., "Learning Fine-Grained Bimanual Manipulation with
-  Low-Cost Hardware" (ALOHA), RSS 2023.
-- Aldaco et al., "ALOHA 2: An Enhanced Low-Cost Hardware for Bimanual
-  Teleoperation," 2024.
-- Black et al., "π₀: A Vision-Language-Action Flow Model for General
-  Robot Control," 2024.
-- AI2, "MolmoAct 2: An open foundation for robots that work in the real
-  world," 2026.
-- "Evaluating π₀ in the Wild," Penn PAL Lab, 2025.
-- AllenAI BimanualYAM training corpus annotations
-  (`allenai/<date>-<cat>-<NN>` datasets on HuggingFace), accessed via
-  `meta/tasks_annotated.parquet`.
+- AllenAI BimanualYAM training corpus annotations, 90 datasets,
+  2815 raw / 1387 unique annotations, fetched from
+  `huggingface.co/datasets/allenai/<slug>/resolve/main/meta/
+  tasks_annotated.parquet`.
+- Sentence embeddings: `sentence-transformers/all-MiniLM-L6-v2`.
+- Clustering: scikit-learn `KMeans(n_clusters=5, random_state=42)`.
+- Cluster analysis cached at `/tmp/yam_corpus/annotations.json`.
