@@ -129,17 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s | %(message)s")
-
-    # Silence i2rt's internal motor-control + CAN threads, which log to
-    # the unnamed `root` logger at INFO every 10–30 s ("Grav Comp Control
-    # Frequency", "Total rate", etc.). They flood stdout during the
-    # score-prompt window and make the operator UI unreadable. Bump root
-    # to WARNING; our own `yam_vla.*` loggers stay at INFO because they
-    # have explicit module names.
-    logging.getLogger().setLevel(logging.WARNING)
-    for name in ("yam_vla", "yam_vla.evals.runner", "yam_vla.hardware",
-                  "yam_vla.control_loop"):
-        logging.getLogger(name).setLevel(logging.INFO)
+    # Cap i2rt's noisy root-logger INFO output; our yam_vla.* loggers
+    # stay at INFO. See yam_vla.core.keyboard.silence_root_logger.
+    from yam_vla.core.keyboard import silence_root_logger
+    silence_root_logger()
 
     p = build_parser()
     args = p.parse_args()

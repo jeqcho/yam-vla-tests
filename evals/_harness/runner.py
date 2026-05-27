@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import select
 import signal
 import sys
 import time
@@ -29,6 +28,14 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from yam_vla.core.keyboard import (
+    AdvanceWatcher as _AdvanceWatcher,
+    RawTerm as _RawTerm,
+    read_key as _read_key,
+    reset_countdown as _reset_countdown,
+    wait_for_advance as _wait_for_advance,
+)
 
 from yam_vla.core import (
     AttemptKnobs, AttemptStats, PolicyConfig, Policy, RerunRecorder,
@@ -44,189 +51,6 @@ from evals._harness.tasks import EvalDefinition, EvalTask
 
 log = logging.getLogger("yam_vla.evals.runner")
 
-
-# ---------------------------------------------------------------------------
-# Raw-stdin keyboard helpers
-# ---------------------------------------------------------------------------
-#
-# The eval is "almost like training-data recording": the operator advances
-# the flow with a single key (default: right-arrow OR Enter), watches the
-# arm execute, presses → again to end the attempt, scores it, then either
-# waits out a reset countdown or presses → again to advance immediately.
-#
-# We use termios cbreak + non-blocking reads via select() so:
-#   - The countdown thread doesn't block on stdin (operator can let it
-#     expire OR interrupt it).
-#   - The attempt-stop watcher doesn't block in `input()` and hold the
-#     terminal in cooked mode.
-#
-# All helpers degrade gracefully when stdin is not a TTY (piped input,
-# CI): the raw-mode context is a no-op and `_read_key` returns None.
-
-class _RawTerm:
-    """Context manager: switch stdin to cbreak (line-buffer off, echo off)
-    and non-blocking. Restores on exit. No-op if stdin isn't a TTY."""
-
-    def __enter__(self):
-        if not sys.stdin.isatty():
-            self.fd = None
-            return self
-        import fcntl
-        import termios
-        import tty
-        self.fd = sys.stdin.fileno()
-        self._termios = termios
-        self._fcntl = fcntl
-        self.old_term = termios.tcgetattr(self.fd)
-        self.old_flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-        tty.setcbreak(self.fd)
-        fcntl.fcntl(self.fd, fcntl.F_SETFL, self.old_flags | os.O_NONBLOCK)
-        return self
-
-    def __exit__(self, *exc):
-        if self.fd is None:
-            return False
-        try:
-            self._termios.tcsetattr(self.fd, self._termios.TCSADRAIN, self.old_term)
-            self._fcntl.fcntl(self.fd, self._fcntl.F_SETFL, self.old_flags)
-        except Exception:
-            pass
-        return False
-
-
-def _read_key(timeout: float = 0.1) -> Optional[str]:
-    """Read one keypress from stdin. Returns a normalized name or None on
-    timeout. Must be called inside a `with _RawTerm():` block.
-
-    Returns:
-      'right' / 'left' / 'up' / 'down'  -- arrow keys (ANSI \\x1b[A-D)
-      'enter'                            -- newline / carriage return
-      'esc'                              -- bare escape
-      one-character str (lowercased)     -- any other printable
-      None                               -- timeout, or non-TTY stdin
-    """
-    if not sys.stdin.isatty():
-        return None
-    try:
-        r, _, _ = select.select([sys.stdin], [], [], timeout)
-    except (OSError, ValueError):
-        return None
-    if not r:
-        return None
-    try:
-        buf = os.read(sys.stdin.fileno(), 16)
-    except (BlockingIOError, OSError):
-        return None
-    if not buf:
-        return None
-    if buf[:1] == b"\x1b":
-        if buf[:3] == b"\x1b[A":
-            return "up"
-        if buf[:3] == b"\x1b[B":
-            return "down"
-        if buf[:3] == b"\x1b[C":
-            return "right"
-        if buf[:3] == b"\x1b[D":
-            return "left"
-        return "esc"
-    if buf in (b"\n", b"\r"):
-        return "enter"
-    try:
-        return buf.decode("utf-8", errors="replace")[:1].lower()
-    except Exception:
-        return None
-
-
-def _wait_for_advance(prompt: str = "") -> str:
-    """Block until the operator presses right-arrow, Enter, 's', 'q', 'r'.
-
-    Returns: 'go' (→ or Enter) | 'skip' (s) | 'quit' (q) | 'redo' (r).
-    Echoes the prompt once. Falls back to stdlib `input()` if stdin is
-    not a TTY.
-    """
-    if prompt:
-        print(prompt, flush=True)
-    if not sys.stdin.isatty():
-        try:
-            ans = (input("> ").strip().lower() or "")
-        except (EOFError, KeyboardInterrupt):
-            return "quit"
-        if ans in ("q", "quit"): return "quit"
-        if ans in ("s", "skip"): return "skip"
-        if ans in ("r", "redo"): return "redo"
-        return "go"
-    with _RawTerm():
-        while True:
-            key = _read_key(timeout=0.5)
-            if key is None:
-                continue
-            if key in ("right", "enter"):
-                return "go"
-            if key == "s":
-                return "skip"
-            if key == "q":
-                return "quit"
-            if key == "r":
-                return "redo"
-
-
-def _reset_countdown(seconds: float, label: str = "next attempt") -> str:
-    """Show a single-line scene-reset prompt and wait for the operator to
-    advance with → or Enter (or skip with 's', quit with 'q').
-
-    `seconds` controls the DISPLAY only — a soft target the operator can
-    use to pace themselves. The countdown counts down to zero, then the
-    display flips to "READY (waited Xs extra)" and the prompt continues
-    waiting indefinitely. The function never auto-advances on timer
-    expiry — only an operator keypress moves the eval forward.
-
-    `seconds <= 0` skips the whole reset-prompt entirely (returns
-    immediately). This preserves backward-compat for evals that
-    declared `reset_seconds_default: 0` to opt out.
-
-    Returns: 'auto' (only when seconds <= 0, i.e. skipped entirely)
-             | 'go' (→ or Enter pressed)
-             | 'skip' ('s' pressed; skip remaining attempts of this task)
-             | 'quit' ('q' pressed; abort the whole eval).
-    """
-    if seconds <= 0:
-        return "auto"
-    if not sys.stdin.isatty():
-        # Non-TTY (CI / piped): no keys available, so honor the soft
-        # target as an actual sleep and return.
-        time.sleep(seconds)
-        return "auto"
-
-    start_t = time.monotonic()
-    with _RawTerm():
-        while True:
-            elapsed = time.monotonic() - start_t
-            remaining = seconds - elapsed
-            if remaining > 0:
-                msg = (
-                    f"\r[reset] {label} in {remaining:5.1f}s  "
-                    f"(→ or Enter advance, 's' skip task, 'q' quit) "
-                )
-            else:
-                # Soft target elapsed — keep waiting until the operator
-                # actually advances. The "extra" counter is just useful
-                # feedback so they know the system isn't hung.
-                extra = -remaining
-                msg = (
-                    f"\r[reset] {label} READY  (+{extra:5.1f}s)  "
-                    f"(→ or Enter advance, 's' skip task, 'q' quit) "
-                )
-            print(f"{msg:<78s}", end="", flush=True)
-            key = _read_key(timeout=0.1)
-            if key is None:
-                continue
-            print("\r" + " " * 78 + "\r", end="", flush=True)
-            if key in ("right", "enter"):
-                return "go"
-            if key == "s":
-                return "skip"
-            if key == "q":
-                return "quit"
 
 
 # ---------------------------------------------------------------------------
@@ -374,61 +198,6 @@ def _prompt_score_attempt(task: EvalTask, attempt: int, n_attempts: int) -> tupl
         except (EOFError, KeyboardInterrupt):
             notes = ""
     return status, notes
-
-
-# ---------------------------------------------------------------------------
-# Stop-watcher: right-arrow OR Enter on stdin breaks out of the running attempt
-# ---------------------------------------------------------------------------
-
-class _AdvanceWatcher:
-    """Background thread that flips a flag when the operator presses
-    right-arrow (→) or Enter.
-
-    Used as the `stop` predicate for run_attempt -- gives the operator a
-    way to end the attempt the moment they see the task succeed/fail,
-    instead of waiting for max_chunks.  Uses raw-mode reads so the
-    operator can keep typing freely between attempts.
-    """
-    def __init__(self):
-        self._stopped = False
-        self._stop_thread = False
-        self._thread = None
-
-    def start(self) -> None:
-        import threading
-
-        def _watch():
-            # Non-TTY stdin (piped, CI): no key-watching possible; sit idle
-            # until the main thread calls stop(). Attempt will then run to
-            # max_chunks.
-            if not sys.stdin.isatty():
-                while not self._stop_thread:
-                    time.sleep(0.1)
-                return
-            with _RawTerm():
-                while not self._stop_thread:
-                    key = _read_key(timeout=0.1)
-                    if key in ("right", "enter"):
-                        self._stopped = True
-                        return
-
-        self._thread = threading.Thread(target=_watch, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        """Signal the watcher thread to exit and wait for it. Must be
-        called before the main thread does any blocking stdin reads, so
-        raw mode is fully restored first."""
-        self._stop_thread = True
-        if self._thread is not None:
-            self._thread.join(timeout=0.5)
-
-    @property
-    def stopped(self) -> bool:
-        return self._stopped
-
-    def predicate(self):
-        return lambda: self._stopped
 
 
 # ---------------------------------------------------------------------------
