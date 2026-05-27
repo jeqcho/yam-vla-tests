@@ -79,7 +79,7 @@ tasks:
 
   - id: wire_rack_lift
     english: wire rack lift
-    instruction: "Lift the black wire rack off the table using both arms."
+    instruction: "Grasp the black wire rack, then lift it off the table."
     meta:
       primitive: coordinated_wide_rigid_lift
       aloha_ancestor: (no direct ALOHA analog; ALOHA-2 bimanual tray task)
