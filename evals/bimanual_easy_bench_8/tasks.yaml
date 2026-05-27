@@ -79,13 +79,18 @@ tasks:
 
   - id: wire_rack_lift
     english: wire rack lift
-    instruction: "Lift the black wire rack off the table using both arms, holding the rack by its short edges."
+    instruction: "Lift the black wire rack off the table using both arms."
     meta:
       primitive: coordinated_wide_rigid_lift
       aloha_ancestor: (no direct ALOHA analog; ALOHA-2 bimanual tray task)
       setup: |
-        Black wire rack flat on the table, short edges oriented toward
-        the left and right arms.
+        Black wire rack flat on the table. Operator deliberately does
+        NOT specify which edges or bars the grippers should target --
+        the policy gets full discretion on grasp point selection.
+        Success = rack is lifted clear of the table with both grippers
+        engaged. The motor primitive being scored is "both grippers
+        commit force at the same time to a single rigid object," not
+        "did the policy match a specific grasp-pose heuristic."
 
   - id: pour_cubes
     english: pour cubes onto plate
