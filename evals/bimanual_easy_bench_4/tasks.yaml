@@ -66,7 +66,7 @@ tasks:
 
   - id: wire_rack_lift
     english: wire rack lift
-    instruction: "Grasp the black wire rack, then lift it off the table."
+    instruction: "Grasp the black wire rack using both arms, then lift it off the table."
     meta:
       primitive: coordinated_wide_rigid_lift
       aloha_ancestor: (no direct ALOHA analog; ALOHA-2 bimanual tray task)
@@ -81,7 +81,7 @@ tasks:
 
   - id: rail_tap
     english: rail tap
-    instruction: "Pick up one wooden rail with each arm, then tap the two wooden rails together."
+    instruction: "Pick up the two wooden rails using both arms, then tap them together."
     meta:
       primitive: midair_bimanual_convergence
       aloha_ancestor: (refined from ALOHA bimanual insertion, precision-alignment stripped out)
@@ -91,7 +91,7 @@ tasks:
 
   - id: marker_uncap
     english: marker uncap
-    instruction: "Hold the red marker with your left arm and pull the cap off the red marker with your right arm."
+    instruction: "Grasp the red marker, then pull the cap off the red marker."
     meta:
       primitive: stabilize_plus_axial_pull
       aloha_ancestor: ALOHA cup uncap
