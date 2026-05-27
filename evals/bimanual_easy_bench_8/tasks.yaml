@@ -1,0 +1,125 @@
+name: bimanual_easy_bench_8
+description: |
+  Eight-task diagnostic suite for bimanual-only manipulation primitives on
+  the YAM rig. Each task isolates ONE bimanual primitive that has no
+  single-arm reduction. Atomic single-instruction prompts — no chained
+  subgoals — so per-task success rate reflects one skill, not the product
+  of several.
+
+  Prompting principles applied (see README.md for sources):
+    - Imperative present tense, no metalanguage ("hold steady" not
+      "stabilize"; "with both arms" not "use both grippers")
+    - "your left arm" / "your right arm" — most-trained phrasing in
+      ALOHA / pi0 / MolmoAct datasets vs "gripper" or "manipulator"
+    - Every object disambiguated by visible attribute (color before noun)
+    - No pronouns — every noun restated to avoid anaphora that depends
+      on the model's working memory
+    - Clean grammar (pi0 freezes on typos / ambiguity per the pi0 paper)
+    - Single atomic verb-result, no "then" chaining unless the second
+      action is the only verifiable end-state
+
+n_attempts_default: 3
+
+# Inter-attempt scene-reset countdown. The flow is:
+#   1. Banner shows TASK + ITER N of X + PROMPT
+#   2. Operator → to start; arms execute the rollout
+#   3. Operator → to end the rollout (or wait for max_chunks)
+#   4. Operator scores s/f/u/r
+#   5. Arms ramp back to ready pose
+#   6. Reset countdown runs while operator resets the physical scene
+#   7. Countdown expires OR operator presses → → next iteration
+# Override per-run with --reset-seconds N (0 disables the countdown).
+reset_seconds_default: 30
+
+tasks:
+  - id: shirt_fold
+    english: shirt fold
+    instruction: "Fold the white shirt in half from left to right so the left side meets the right side."
+    meta:
+      primitive: symmetric_coord_deformable
+      aloha_ancestor: Mobile ALOHA t-shirt fold
+      setup: |
+        White t-shirt laid flat on the table lengthwise. Collar end on
+        the LEFT side of the workspace, hem end on the RIGHT side. The
+        fold motion brings the left half of the shirt over to meet the
+        right half. Sleeves are tucked / not visible from the overhead
+        camera, so the prompt deliberately doesn't reference them.
+
+  - id: velcro_pull
+    english: velcro pull-apart
+    instruction: "Pull apart the two black velcro strips."
+    meta:
+      primitive: opposing_impulsive_force
+      aloha_ancestor: ALOHA velcro cable tie (reversed)
+      setup: |
+        Two black velcro strips pressed together at a perpendicular cross,
+        centered on the table. Re-press to a target force between trials
+        to keep starting bond strength uniform.
+
+  - id: cube_handoff
+    english: cube hand-off to plate
+    instruction: "Pick up the orange cube with your left arm, pass the orange cube to your right arm, then place the orange cube on the green plate."
+    meta:
+      primitive: discrete_midtraj_transfer
+      aloha_ancestor: ALOHA cube transfer
+      setup: |
+        Orange cube positioned on the left side of the workspace, within
+        comfortable reach of the left arm. Green plate on the right side,
+        within comfortable reach of the right arm.
+
+  - id: wire_rack_lift
+    english: wire rack lift
+    instruction: "Lift the black wire rack off the table using both arms, holding the rack by its short edges."
+    meta:
+      primitive: coordinated_wide_rigid_lift
+      aloha_ancestor: (no direct ALOHA analog; ALOHA-2 bimanual tray task)
+      setup: |
+        Black wire rack flat on the table, short edges oriented toward
+        the left and right arms.
+
+  - id: pour_cubes
+    english: pour cubes onto plate
+    instruction: "Pick up the orange cup with your right arm and the green plate with your left arm, then pour the orange cubes from the orange cup onto the green plate."
+    meta:
+      primitive: asymmetric_tool_and_receiver
+      aloha_ancestor: ALOHA chip-bag pour
+      setup: |
+        Orange cup half-full of small orange cubes on the right side.
+        Green plate on the left side. Both must end held off the table.
+
+  - id: rail_tap
+    english: rail tap
+    instruction: "Pick up one wooden rail with each arm, then tap the two wooden rails together."
+    meta:
+      primitive: midair_bimanual_convergence
+      aloha_ancestor: (refined from ALOHA bimanual insertion, precision-alignment stripped out)
+      setup: |
+        Two short wooden rail segments, one on each side of the
+        workspace.
+
+  - id: marker_uncap
+    english: marker uncap
+    instruction: "Hold the red marker with your left arm and pull the cap off the red marker with your right arm."
+    meta:
+      primitive: stabilize_plus_axial_pull
+      aloha_ancestor: ALOHA cup uncap
+      setup: |
+        Red marker (capped) centered on the table, oriented so the cap
+        end faces the right arm.
+
+  - id: allen_wrench_turn
+    english: allen wrench rotation
+    instruction: "Hold the wooden block with your left arm and turn the allen wrench in the wooden block with your right arm."
+    meta:
+      primitive: stabilize_plus_torque
+      aloha_ancestor: ALOHA cup uncap (rotational variant)
+      setup: |
+        Wooden block with embedded screw + allen wrench seated, block
+        flat on the table.
+      scoring_note: |
+        Success = ANY visible rotation of the allen wrench while the
+        wooden block stayed put. Direction and magnitude don't matter;
+        what's measured is whether the policy applied torque through
+        the wrench while the other arm successfully countered the
+        reaction torque. A wrench that doesn't move means the block
+        slipped or the gripper missed.

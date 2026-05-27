@@ -7018,3 +7018,36 @@
 - `train_fps`: 30.0
 - `warmup_timeout_s`: 60.0
 
+
+---
+## 2026-05-26 15:21:07 -- success
+
+**Notes**: [policy=molmoact2] eval=bimanual_easy_bench_8  
+
+**Duration**: 5m 22s
+
+**Command**:
+```
+scripts/run_eval.py --policy molmoact2 --eval bimanual_easy_bench_8 --samples 1 --dry-run
+```
+
+**Configuration**:
+- `attempts`: 1
+- `cam_fps`: 30
+- `cam_height`: 240
+- `cam_width`: 424
+- `config_dir`: /home/andon/yam-vla-tests/configs/policy
+- `dry_run`: True
+- `eval_name`: bimanual_easy_bench_8
+- `evals_dir`: /home/andon/yam-vla-tests/evals
+- `gripper_step`: 0.15
+- `horizon_stride`: 6
+- `inference_mode`: sync
+- `journal_path`: /home/andon/yam-vla-tests/journal.md
+- `max_chunks`: 200
+- `max_step_rad`: 0.15
+- `num_steps`: 10
+- `policy`: molmoact2
+- `timeout_s`: 15.0
+- `train_fps`: 30.0
+

@@ -45,11 +45,18 @@ class EvalTask:
 
 @dataclass(frozen=True)
 class EvalDefinition:
-    """Top-level eval = name + description + ordered task list."""
-    name:               str
-    description:        str
-    n_attempts_default: int
-    tasks:              tuple[EvalTask, ...]
+    """Top-level eval = name + description + ordered task list.
+
+    `reset_seconds_default` is the inter-attempt scene-reset countdown
+    used when the operator hasn't passed --reset-seconds on the CLI.
+    0 keeps the legacy operator-driven flow (no countdown between
+    attempts, advance only on Enter / right-arrow).
+    """
+    name:                  str
+    description:           str
+    n_attempts_default:    int
+    tasks:                 tuple[EvalTask, ...]
+    reset_seconds_default: float = 0.0
 
 
 def load_tasks(path: str | Path) -> EvalDefinition:
@@ -82,4 +89,5 @@ def load_tasks(path: str | Path) -> EvalDefinition:
         description=str(data.get("description", "")),
         n_attempts_default=int(data.get("n_attempts_default", 3)),
         tasks=tuple(tasks),
+        reset_seconds_default=float(data.get("reset_seconds_default", 0.0)),
     )
