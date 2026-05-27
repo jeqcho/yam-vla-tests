@@ -1,18 +1,20 @@
-name: bimanual_easy_bench_5
+name: bimanual_easy_bench_4
 description: |
-  Five-task diagnostic suite for bimanual-only manipulation primitives on
+  Four-task diagnostic suite for bimanual-only manipulation primitives on
   the YAM rig. Each task isolates ONE bimanual primitive that has no
   single-arm reduction. Atomic single-instruction prompts — no chained
   subgoals — so per-task success rate reflects one skill, not the product
   of several.
 
-  Renamed from bimanual_easy_bench_8 after dropping three tasks judged
+  Renamed from bimanual_easy_bench_8 after dropping four tasks judged
   too hard or off-distribution for molmoact2-BimanualYAM:
     - bag_fold        (deformable fold; "Fold" verb 0/591 in YAM corpus;
                        10/10 failure observed on initial run)
     - cube_handoff    (discrete mid-trajectory transfer; "pass" 0/591)
     - allen_wrench_turn (stabilize + rotational torque; rotation verbs
                        entirely absent from corpus)
+    - pour_cubes      (asymmetric tool + receiver; "pour" 0/591,
+                       granular-flow primitive absent from training)
   And one task added in their place:
     - cube_into_gray_box  (bimanual insertion into a held receptacle;
                        directly matches the corpus's dominant "Pick up
@@ -76,16 +78,6 @@ tasks:
         engaged. The motor primitive being scored is "both grippers
         commit force at the same time to a single rigid object," not
         "did the policy match a specific grasp-pose heuristic."
-
-  - id: pour_cubes
-    english: pour cubes onto plate
-    instruction: "Pick up the orange cup with your right arm and the green plate with your left arm, then pour the orange cubes from the orange cup onto the green plate."
-    meta:
-      primitive: asymmetric_tool_and_receiver
-      aloha_ancestor: ALOHA chip-bag pour
-      setup: |
-        Orange cup half-full of small orange cubes on the right side.
-        Green plate on the left side. Both must end held off the table.
 
   - id: rail_tap
     english: rail tap

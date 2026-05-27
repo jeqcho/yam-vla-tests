@@ -1,6 +1,6 @@
-# bimanual_easy_bench_5 — diagnostic 5-task bimanual suite
+# bimanual_easy_bench_4 — diagnostic 4-task bimanual suite
 
-A short, diagnostic eval covering **five distinct bimanual manipulation
+A short, diagnostic eval covering **four distinct bimanual manipulation
 primitives** chosen to be tractable on the bimanual YAM rig. The "easier
 than IKEA, more informative than LIBERO-Object" canonical benchmark for
 this hardware.
@@ -15,15 +15,15 @@ Renamed from `bimanual_easy_bench_8` after three tasks were dropped
 ./scripts/run_server.sh molmoact2     # or pi05 / gr00t-n17
 
 # 2. Run the eval (Terminal B). Samples = attempts per task.
-uv run scripts/run_eval.py --policy molmoact2 --eval bimanual_easy_bench_5 \
+uv run scripts/run_eval.py --policy molmoact2 --eval bimanual_easy_bench_4 \
     --samples 5
 
 # Same eval with a longer reset window:
-uv run scripts/run_eval.py --policy pi05 --eval bimanual_easy_bench_5 \
+uv run scripts/run_eval.py --policy pi05 --eval bimanual_easy_bench_4 \
     --samples 3 --reset-seconds 60
 
 # Disable the countdown (operator-driven, advance only on Enter / right-arrow):
-uv run scripts/run_eval.py --policy gr00t-n17 --eval bimanual_easy_bench_5 \
+uv run scripts/run_eval.py --policy gr00t-n17 --eval bimanual_easy_bench_4 \
     --reset-seconds 0
 ```
 
@@ -55,7 +55,7 @@ arrow) is the universal "advance" key.** Enter works the same.
    'q' to abort the entire eval.
 ```
 
-## The five tasks
+## The four tasks
 
 Each task isolates a distinct **bimanual primitive** — a motor skill
 that has no single-arm sequential reduction.
@@ -64,9 +64,8 @@ that has no single-arm sequential reduction.
 |----|-----------------------|--------------------------------------------------|---------------------------------------------|
 | 1  | cube into gray box    | Bimanual insertion (held receptacle)             | ALOHA peg-in-socket                         |
 | 2  | wire rack lift        | Coordinated wide-rigid lift                      | ALOHA-2 bimanual tray                       |
-| 3  | pour cubes            | Asymmetric tool + receiver, flow                 | ALOHA chip-bag pour                         |
-| 4  | rail tap              | Mid-air bimanual convergence                     | refined from ALOHA bimanual insertion       |
-| 5  | marker uncap          | Stabilize + axial pull                           | ALOHA cup uncap                             |
+| 3  | rail tap              | Mid-air bimanual convergence                     | refined from ALOHA bimanual insertion       |
+| 4  | marker uncap          | Stabilize + axial pull                           | ALOHA cup uncap                             |
 
 **Why these five and not the original eight?** Two filters were applied
 to every task:
@@ -98,6 +97,10 @@ Plus a third filter added after early hardware runs:
 - `velcro_pull` — replaced (see below). Original setup was infeasible:
   velcro strips too small to be picked up off the table by the YAM
   gripper.
+- `pour_cubes` — asymmetric tool + receiver (pour). "Pour" verb is
+  0/591 in corpus. Granular-flow primitive is absent from the
+  rigid-pick-place training distribution. Dropped after re-scoping
+  to "tasks that should plausibly succeed at >0%."
 
 **Added:**
 - `cube_into_gray_box` — bimanual insertion into a held receptacle.
