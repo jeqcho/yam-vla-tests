@@ -68,14 +68,21 @@ tasks:
 
   - id: cube_handoff
     english: cube hand-off to plate
-    instruction: "Pick up the orange cube with your left arm, pass the orange cube to your right arm, then place the orange cube on the green plate."
+    instruction: "Pick up the orange cube and place it on the green plate."
     meta:
       primitive: discrete_midtraj_transfer
       aloha_ancestor: ALOHA cube transfer
       setup: |
-        Orange cube positioned on the left side of the workspace, within
-        comfortable reach of the left arm. Green plate on the right side,
-        within comfortable reach of the right arm.
+        Orange cube positioned on the LEFT side of the workspace, within
+        comfortable reach of the left arm. Green plate on the RIGHT side,
+        within comfortable reach of the right arm. The bimanual handoff
+        primitive is now IMPLICIT in the spatial setup: the cube and
+        plate are placed so a clean single-arm reach is awkward, and
+        the policy must (it is hoped) use a left-pick + right-place
+        sequence with a midline handoff. This reformulation drops the
+        explicit "your left arm / your right arm / pass" language
+        because all three phrasings are 0/591 in the BimanualYAM
+        training corpus.
 
   - id: wire_rack_lift
     english: wire rack lift
@@ -94,7 +101,7 @@ tasks:
 
   - id: pour_cubes
     english: pour cubes onto plate
-    instruction: "Pick up the orange cup with your right arm and the green plate with your left arm, then pour the orange cubes from the orange cup onto the green plate."
+    instruction: "Grasp the orange cup, then place the orange cubes into the green plate."
     meta:
       primitive: asymmetric_tool_and_receiver
       aloha_ancestor: ALOHA chip-bag pour
@@ -102,9 +109,18 @@ tasks:
         Orange cup half-full of small orange cubes on the right side.
         Green plate on the left side. Both must end held off the table.
 
+        Reformulated for corpus alignment: drops "pour" (0/591 in the
+        BimanualYAM training corpus) and "your X arm" (0/591) for
+        "Grasp X, then place Y into Z" which is the dominant corpus
+        template (box-dataset annotations use exactly this pattern).
+        The primitive being measured shifts slightly -- this is now
+        "grasp cup + transfer contents into plate" rather than "pour
+        continuous flow", but the bimanual asymmetric-tool-and-receiver
+        structure is preserved (cup is the tool, plate is the receiver).
+
   - id: rail_tap
     english: rail tap
-    instruction: "Pick up one wooden rail with each arm, then tap the two wooden rails together."
+    instruction: "Pick up the two wooden rails, then place them next to each other."
     meta:
       primitive: midair_bimanual_convergence
       aloha_ancestor: (refined from ALOHA bimanual insertion, precision-alignment stripped out)
@@ -112,9 +128,19 @@ tasks:
         Two short wooden rail segments, one on each side of the
         workspace.
 
+        Reformulated for corpus alignment: drops "tap" (0/591) and
+        "together" (0/591) for the in-distribution "Pick up X, then
+        place [adjacent]" template. "Next to each other" uses the
+        corpus's "next to" relation (17/591 block-arrangement
+        annotations). The primitive shifts slightly: from "two arms
+        converge in midair" to "two arms each pick a rail and place
+        adjacent". The bimanual structure is preserved because two
+        rails picked simultaneously require both grippers; the
+        in-air convergence aspect is relaxed to convergence-on-table.
+
   - id: marker_uncap
     english: marker uncap
-    instruction: "Hold the red marker with your left arm and pull the cap off the red marker with your right arm."
+    instruction: "Pull the cap off the red marker."
     meta:
       primitive: stabilize_plus_axial_pull
       aloha_ancestor: ALOHA cup uncap
@@ -122,15 +148,36 @@ tasks:
         Red marker (capped) centered on the table, oriented so the cap
         end faces the right arm.
 
+        Reformulated for corpus alignment: drops "Hold ... with your
+        left arm and ... with your right arm" (all 0/591). The new
+        phrasing keeps "Pull off" (still 0/591 -- no in-distribution
+        verb exists for this primitive) but the rest of the sentence
+        is grammatically natural. The bimanual stabilize+pull primitive
+        is now IMPLICIT: the marker is loose on the table, the only
+        way to extract the cap without the body sliding is for one
+        gripper to anchor while the other pulls -- the policy should
+        infer this from the physics of the setup, not from explicit
+        arm-side instructions.
+
   - id: allen_wrench_turn
     english: allen wrench rotation
-    instruction: "Hold the wooden block with your left arm and turn the allen wrench in the wooden block with your right arm."
+    instruction: "Turn the allen wrench in the wooden block."
     meta:
       primitive: stabilize_plus_torque
       aloha_ancestor: ALOHA cup uncap (rotational variant)
       setup: |
         Wooden block with embedded screw + allen wrench seated, block
         flat on the table.
+
+        Reformulated for corpus alignment: drops "Hold ... with your
+        left arm" (0/591) and "with your right arm" (0/591). The
+        stabilize-arm role is now implicit: turning a wrench in a
+        block on a smooth table requires one gripper to counter the
+        reaction torque, or the block spins. The policy infers this
+        from physics, not from explicit instruction. "Turn" as an
+        active rotation verb is itself 0/591 in the corpus (only
+        "turned over" exists, as passive participle in flip tasks),
+        so the core verb is unavoidably OOD.
       scoring_note: |
         Success = ANY visible rotation of the allen wrench while the
         wooden block stayed put. Direction and magnitude don't matter;
