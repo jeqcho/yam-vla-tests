@@ -32,18 +32,28 @@ n_attempts_default: 3
 reset_seconds_default: 30
 
 tasks:
-  - id: shirt_fold
-    english: shirt fold
-    instruction: "Fold the white shirt in half from left to right so the left side meets the right side."
+  - id: bag_fold
+    english: bag fold
+    instruction: "Fold the white plastic bag in half from right to left so the right side meets the left side."
     meta:
       primitive: symmetric_coord_deformable
-      aloha_ancestor: Mobile ALOHA t-shirt fold
+      aloha_ancestor: ALOHA towel / cloth fold
       setup: |
-        White t-shirt laid flat on the table lengthwise. Collar end on
-        the LEFT side of the workspace, hem end on the RIGHT side. The
-        fold motion brings the left half of the shirt over to meet the
-        right half. Sleeves are tucked / not visible from the overhead
-        camera, so the prompt deliberately doesn't reference them.
+        White plastic garbage bag laid flat on the table as a
+        rectangle (the bag's natural geometry when emptied). A red
+        drawstring line runs across the top edge -- this is the high-
+        contrast visual anchor the policy grounds on. Fold motion
+        brings the right half of the bag over to meet the left half.
+
+        Why a bag instead of a t-shirt (the previous task):
+          - Rectangle has an obvious vertical centerline; T-shirt
+            silhouette is a T-shape with non-trivial concavities at
+            the sleeve junctions.
+          - Red line provides a high-contrast feature for visual
+            grounding; white-shirt-on-white-table is visually uniform.
+          - Post-fold geometry is a deterministic smaller rectangle;
+            shirts fold into irregular drape shapes that are hard
+            to score.
 
   - id: velcro_pull
     english: velcro pull-apart
