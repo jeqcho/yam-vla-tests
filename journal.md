@@ -7051,3 +7051,73 @@ scripts/run_eval.py --policy molmoact2 --eval bimanual_easy_bench_8 --samples 1 
 - `timeout_s`: 15.0
 - `train_fps`: 30.0
 
+
+---
+## 2026-05-26 17:41:36 -- success
+
+**Purpose**: testing lighting in front lol
+
+**Notes**: [repl policy=molmoact2] picked up orange cubes. i think lighting in front was bad
+
+**Duration**: 8m 51s
+
+**Command**:
+```
+scripts/run_repl.py --policy molmoact2 --rerun
+```
+
+**Configuration**:
+- `cam_fps`: 30
+- `cam_height`: 240
+- `cam_width`: 424
+- `config_dir`: /home/andon/yam-vla-tests/configs/policy
+- `gripper_step`: 0.15
+- `horizon_stride`: 30
+- `inference_mode`: sync
+- `journal_path`: /home/andon/yam-vla-tests/journal.md
+- `max_chunks`: 200
+- `max_step_rad`: 0.15
+- `num_steps`: 10
+- `policy`: molmoact2
+- `rerun`: True
+- `timeout_s`: 15.0
+- `train_fps`: 30.0
+
+
+---
+## 2026-05-26 19:18:22 -- failure
+
+**Purpose**: garbage bag, task 1
+
+**Notes**: [policy=molmoact2] eval=bimanual_easy_bench_8  0/10 successes. one failure accidentally recorded as a skip, oops
+
+**Duration**: 16m 58s
+
+**Command**:
+```
+scripts/run_eval.py --policy molmoact2 --eval bimanual_easy_bench_8 --samples 10 --rerun
+```
+
+**Configuration**:
+- `attempt_timeout_s`: 60.0
+- `attempts`: 10
+- `cam_fps`: 30
+- `cam_height`: 240
+- `cam_width`: 424
+- `config_dir`: /home/andon/yam-vla-tests/configs/policy
+- `eval_name`: bimanual_easy_bench_8
+- `evals_dir`: /home/andon/yam-vla-tests/evals
+- `gripper_step`: 0.15
+- `horizon_stride`: 30
+- `inference_mode`: sync
+- `journal_path`: /home/andon/yam-vla-tests/journal.md
+- `max_chunks`: 200
+- `max_step_rad`: 0.15
+- `num_steps`: 10
+- `policy`: molmoact2
+- `ready_pose`: [-0.1, 1.36, 1.18, -0.7, 0.16, -0.22, 0.62, 0.1, 1.36, 1.18, -0.7, -0.16, 0.22, 0.62]
+- `ready_pose_ramp_duration_s`: 5.0
+- `rerun`: True
+- `timeout_s`: 15.0
+- `train_fps`: 30.0
+

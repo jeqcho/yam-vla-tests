@@ -1,10 +1,23 @@
-name: bimanual_easy_bench_8
+name: bimanual_easy_bench_5
 description: |
-  Eight-task diagnostic suite for bimanual-only manipulation primitives on
+  Five-task diagnostic suite for bimanual-only manipulation primitives on
   the YAM rig. Each task isolates ONE bimanual primitive that has no
   single-arm reduction. Atomic single-instruction prompts — no chained
   subgoals — so per-task success rate reflects one skill, not the product
   of several.
+
+  Renamed from bimanual_easy_bench_8 after dropping three tasks judged
+  too hard or off-distribution for molmoact2-BimanualYAM:
+    - bag_fold        (deformable fold; "Fold" verb 0/591 in YAM corpus;
+                       10/10 failure observed on initial run)
+    - cube_handoff    (discrete mid-trajectory transfer; "pass" 0/591)
+    - allen_wrench_turn (stabilize + rotational torque; rotation verbs
+                       entirely absent from corpus)
+  And one task added in their place:
+    - cube_into_gray_box  (bimanual insertion into a held receptacle;
+                       directly matches the corpus's dominant "Pick up
+                       + Place X into Y" template — 263 "into"
+                       occurrences in 591 annotations)
 
   Prompting principles applied (see README.md for sources):
     - Imperative present tense, no metalanguage ("hold steady" not
@@ -32,50 +45,22 @@ n_attempts_default: 3
 reset_seconds_default: 30
 
 tasks:
-  - id: bag_fold
-    english: bag fold
-    instruction: "Fold the white plastic bag in half from right to left so the right side meets the left side."
+  - id: cube_into_gray_box
+    english: cube into held gray box
+    instruction: "Pick up the gray box with your left arm and place the orange cube into the box with your right arm."
     meta:
-      primitive: symmetric_coord_deformable
-      aloha_ancestor: ALOHA towel / cloth fold
+      primitive: bimanual_insertion_held_receptacle
+      aloha_ancestor: ALOHA peg-in-socket (canonical bimanual insertion)
       setup: |
-        White plastic garbage bag laid flat on the table as a
-        rectangle (the bag's natural geometry when emptied). A red
-        drawstring line runs across the top edge -- this is the high-
-        contrast visual anchor the policy grounds on. Fold motion
-        brings the right half of the bag over to meet the left half.
-
-        Why a bag instead of a t-shirt (the previous task):
-          - Rectangle has an obvious vertical centerline; T-shirt
-            silhouette is a T-shape with non-trivial concavities at
-            the sleeve junctions.
-          - Red line provides a high-contrast feature for visual
-            grounding; white-shirt-on-white-table is visually uniform.
-          - Post-fold geometry is a deterministic smaller rectangle;
-            shirts fold into irregular drape shapes that are hard
-            to score.
-
-  - id: velcro_pull
-    english: velcro pull-apart
-    instruction: "Pull apart the two black velcro strips."
-    meta:
-      primitive: opposing_impulsive_force
-      aloha_ancestor: ALOHA velcro cable tie (reversed)
-      setup: |
-        Two black velcro strips pressed together at a perpendicular cross,
-        centered on the table. Re-press to a target force between trials
-        to keep starting bond strength uniform.
-
-  - id: cube_handoff
-    english: cube hand-off to plate
-    instruction: "Pick up the orange cube with your left arm, pass the orange cube to your right arm, then place the orange cube on the green plate."
-    meta:
-      primitive: discrete_midtraj_transfer
-      aloha_ancestor: ALOHA cube transfer
-      setup: |
-        Orange cube positioned on the left side of the workspace, within
-        comfortable reach of the left arm. Green plate on the right side,
-        within comfortable reach of the right arm.
+        Empty gray box on the LEFT side of the workspace, orange cube
+        on the RIGHT side. Box must be small enough that the left
+        gripper can fully lift it (not a heavy crate). The bimanual
+        structure is forced by the explicit "Pick up the gray box
+        first" clause -- the cube goes into a held receptacle, not
+        a table-resting one. Most corpus-aligned task in the suite:
+        the "Place X into Y" template is the dominant pattern in
+        AllenAI's BimanualYAM training corpus (263 "into" tokens in
+        591 annotations).
 
   - id: wire_rack_lift
     english: wire rack lift
@@ -121,20 +106,3 @@ tasks:
       setup: |
         Red marker (capped) centered on the table, oriented so the cap
         end faces the right arm.
-
-  - id: allen_wrench_turn
-    english: allen wrench rotation
-    instruction: "Hold the wooden block with your left arm and turn the allen wrench in the wooden block with your right arm."
-    meta:
-      primitive: stabilize_plus_torque
-      aloha_ancestor: ALOHA cup uncap (rotational variant)
-      setup: |
-        Wooden block with embedded screw + allen wrench seated, block
-        flat on the table.
-      scoring_note: |
-        Success = ANY visible rotation of the allen wrench while the
-        wooden block stayed put. Direction and magnitude don't matter;
-        what's measured is whether the policy applied torque through
-        the wrench while the other arm successfully countered the
-        reaction torque. A wrench that doesn't move means the block
-        slipped or the gripper missed.
