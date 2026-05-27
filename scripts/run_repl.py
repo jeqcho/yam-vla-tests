@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--train-fps", type=float, default=DEFAULT_TRAIN_FPS)
     p.add_argument("--num-steps", type=int, default=10)
     p.add_argument("--timeout-s", type=float, default=15.0)
+    p.add_argument("--attempt-timeout-s", type=float, default=60.0,
+                   dest="attempt_timeout_s",
+                   help="per-attempt wall-clock cap (s); rollout auto-ends "
+                        "and you go back to the prompt. 0 = disabled.")
     p.add_argument("--inference-mode", default="sync",
                    choices=["sync", "async-naive", "async-time-aligned"])
     p.add_argument("--dry-run", action="store_true")
@@ -246,6 +250,7 @@ def main() -> None:
                 max_step_rad=args.max_step_rad,
                 gripper_step=args.gripper_step,
                 timeout_s=args.timeout_s,
+                attempt_timeout_s=args.attempt_timeout_s,
                 inference_mode=args.inference_mode,
                 dry_run=args.dry_run,
                 policy_opts={"num_steps": args.num_steps},

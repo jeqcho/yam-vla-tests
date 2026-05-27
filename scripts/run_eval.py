@@ -79,6 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="flow-matching steps (molmoact2 only; others ignore)")
     grp.add_argument("--timeout-s", type=float, default=15.0,
                      help="per-inference HTTP/WS/ZMQ timeout")
+    grp.add_argument("--attempt-timeout-s", type=float, default=60.0,
+                     dest="attempt_timeout_s",
+                     help="per-attempt wall-clock cap (s). When this "
+                          "elapses, the rollout ends and the operator is "
+                          "prompted for a score -- same flow as pressing "
+                          "→. 0 disables the timeout (max_chunks is then "
+                          "the only safety bound).")
     grp.add_argument("--inference-mode", default="sync",
                      choices=["sync", "async-naive", "async-time-aligned"])
     grp.add_argument("--dry-run", action="store_true",

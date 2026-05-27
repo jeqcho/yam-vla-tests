@@ -372,6 +372,7 @@ def start_session(
                     max_step_rad=getattr(args, "max_step_rad", DEFAULT_MAX_STEP_RAD),
                     gripper_step=getattr(args, "gripper_step", DEFAULT_GRIPPER_STEP),
                     timeout_s=getattr(args, "timeout_s", 15.0),
+                    attempt_timeout_s=getattr(args, "attempt_timeout_s", 60.0),
                     inference_mode=getattr(args, "inference_mode", "sync"),
                     dry_run=getattr(args, "dry_run", False),
                     policy_opts={"num_steps": getattr(args, "num_steps", 10)},

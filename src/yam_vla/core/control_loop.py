@@ -48,7 +48,8 @@ class AttemptKnobs:
     horizon_stride:  int   = DEFAULT_HORIZON_STRIDE
     max_step_rad:    float = DEFAULT_MAX_STEP_RAD
     gripper_step:    float = DEFAULT_GRIPPER_STEP
-    timeout_s:       float = 15.0
+    timeout_s:       float = 15.0            # per-INFERENCE-CALL HTTP/ZMQ/WS timeout
+    attempt_timeout_s: float = 60.0          # per-ATTEMPT wall-clock cap; 0 = disabled
     inference_mode:  str   = "sync"          # "sync" | "async-naive" | "async-time-aligned"
     dry_run:         bool  = False
     policy_opts:     dict  = field(default_factory=dict)  # e.g. {"num_steps": 10}
@@ -57,7 +58,7 @@ class AttemptKnobs:
 @dataclass
 class AttemptStats:
     """What run_attempt returns -- the per-attempt CSV row inputs."""
-    status:             str   = "incomplete"   # "success"|"failure"|"crash"|"quit"
+    status:             str   = "incomplete"   # "quit"|"timeout"|"maxchunks"|"crash"
     chunks:             int   = 0
     duration_s:         float = 0.0
     rtt_ms_mean:        float = 0.0
@@ -152,6 +153,12 @@ def run_attempt(
         while stats.chunks < knobs.max_chunks:
             if stop():
                 stats.status = "quit"
+                break
+            if knobs.attempt_timeout_s > 0 and \
+                    (time.perf_counter() - loop_t0) >= knobs.attempt_timeout_s:
+                log.info("attempt timeout (%.0fs) reached after %d chunks; ending",
+                         knobs.attempt_timeout_s, stats.chunks)
+                stats.status = "timeout"
                 break
 
             # SYNC: capture, predict (blocking), then play chunk.
