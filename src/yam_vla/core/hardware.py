@@ -246,39 +246,36 @@ class RealSenseStream(CameraStream):
                  self.name, self.serial, self.width, self.height, self.fps, got)
 
     def grab(self) -> np.ndarray:
-        # FAIL-FAST grab semantics. Previous version blocked up to ~15 s
-        # on a hard camera disconnect while attempting an in-process
-        # pipeline restart. On this rig that long blocking window
-        # correlates with CAN-USB disruption (cameras and CAN dongles
-        # share USB controllers), which causes the motor chain to lose
-        # comms and arms to fall under gravity. When comms return the
-        # arms snap to commanded position -- whiplash that broke
-        # a camera stand on 2026-05-28.
+        # FAIL-FAST grab semantics. NO in-band restart -- the prior
+        # "try a restart inside grab()" path could block for 9+ seconds
+        # inside librealsense's pipeline.start(), during which the
+        # control loop couldn't honor the watchdog's stop flag (Python
+        # GIL doesn't interrupt C calls). Those 9 seconds were enough
+        # for motors to lose CAN comms, arms to drop, and i2rt's
+        # auto-recovery to snap them back -- the watchdog warning then
+        # printed AFTER the damage was done. (Incident 2026-05-28 #2.)
         #
         # New behavior:
-        #   - Primary wait: 1.5 s (was 2 s)
-        #   - On timeout: ONE quick pipeline restart attempt with a
-        #     1.5 s warmup budget (was 5 s); if that fails, RAISE.
-        #   - Total max blocking: ~3 s (was ~15 s)
+        #   - Primary wait: 1.5 s
+        #   - On timeout: RAISE immediately. No restart attempt.
+        #   - Total max blocking: 1.5 s
         #
         # The runner catches the raise, marks the attempt crashed, and
-        # PROMPTS the operator before doing any further arm motion --
-        # so a quick fail here is much safer than a long block.
+        # the post-crash gate prompts the operator before any arm
+        # motion. To recover from camera trouble, the operator restarts
+        # the eval (which re-runs camera start() with its 20 s warmup
+        # budget that IS allowed to block, because no rollout is active
+        # and no arms are under commanded position).
         try:
             frames = self.pipeline.wait_for_frames(timeout_ms=1500)
-        except RuntimeError as e1:
-            log.warning("camera %s (%s): grab timeout (%s); attempting quick restart",
-                        self.name, self.serial, e1)
-            try:
-                self._restart_pipeline()
-                frames = self.pipeline.wait_for_frames(timeout_ms=1500)
-            except (RuntimeError, Exception) as e2:
-                raise RuntimeError(
-                    f"camera {self.name} ({self.serial}) grab failed: {e2}. "
-                    f"Crashed-attempt path will run -- arms will NOT move "
-                    f"automatically. Physically inspect arms + camera, then "
-                    f"re-run list_cams.py to verify USB 3 link."
-                ) from e2
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"camera {self.name} ({self.serial}) grab failed: {e}. "
+                f"Crashed-attempt path will run -- arms will NOT move "
+                f"automatically. Physically inspect arms + camera, then "
+                f"restart the eval session (camera start() will re-init "
+                f"the pipeline). Verify USB 3 link with list_cams.py."
+            ) from e
         color = frames.get_color_frame()
         if not color:
             raise RuntimeError(f"camera {self.name} produced no color frame")
