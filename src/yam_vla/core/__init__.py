@@ -26,6 +26,7 @@ from yam_vla.core.runner import (
 from yam_vla.core.hardware import (
     install_sdk_lock_fix,
     load_setup_config,
+    CameraHealthWatcher,
     CameraStream,
     RealSenseStream,
     V4L2Stream,
@@ -66,6 +67,11 @@ from yam_vla.core.control_loop import (
     run_attempt,
 )
 
+# Embodiment registry (yam | trlc_dk1 | ...). Imported here so callers
+# can do `from yam_vla.core import get_backend` without reaching into the
+# subpackage. The Protocols themselves live in yam_vla.embodiments.base.
+from yam_vla.embodiments import get_backend, known_embodiments
+
 
 __all__ = [
     # observation / state / abstractions
@@ -77,6 +83,7 @@ __all__ = [
     # hardware
     "install_sdk_lock_fix", "load_setup_config",
     "CameraStream", "RealSenseStream", "V4L2Stream", "make_camera",
+    "CameraHealthWatcher",
     "init_arm", "read_state", "ramp_to_pose",
     "DEFAULT_TRAIN_FPS", "DEFAULT_HORIZON_STRIDE",
     "DEFAULT_CAM_WIDTH", "DEFAULT_CAM_HEIGHT", "DEFAULT_CAM_FPS",
@@ -90,4 +97,6 @@ __all__ = [
     "RerunRecorder",
     # control loop
     "AttemptKnobs", "AttemptStats", "run_attempt",
+    # embodiments
+    "get_backend", "known_embodiments",
 ]

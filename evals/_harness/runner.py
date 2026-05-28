@@ -371,6 +371,19 @@ def start_session(
                 # Run the attempt. Operator presses → (or Enter) to end early.
                 watcher = _AdvanceWatcher()
                 watcher.start()
+                # Camera-health watchdog: detects stale-camera within
+                # ~100ms (much faster than waiting for the next grab()
+                # to time out 1.5s in), exits rollout cleanly before
+                # the camera-CAN-USB cascade reaches motor watchdog.
+                # See yam_vla.core.hardware.CameraHealthWatcher docstring.
+                from yam_vla.core.hardware import CameraHealthWatcher
+                cam_watchdog = CameraHealthWatcher(
+                    cameras=[top, cam_l, cam_r],
+                    stale_threshold_s=float(
+                        getattr(args, "camera_stale_threshold_s", 0.6)
+                    ),
+                )
+                cam_watchdog.start()
                 knobs = AttemptKnobs(
                     instruction=prompt_text,
                     max_chunks=getattr(args, "max_chunks", 200),
@@ -385,6 +398,10 @@ def start_session(
                     policy_opts={"num_steps": getattr(args, "num_steps", 10)},
                 )
                 print("\n[running] arms moving. press → (or Enter) to STOP.", flush=True)
+                # Combined stop predicate: operator advance OR camera health alarm.
+                # Either fires => rollout exits cleanly.
+                def _combined_stop():
+                    return watcher.stopped or cam_watchdog.stopped
                 attempt_crashed = False
                 attempt_error: Optional[BaseException] = None
                 try:
@@ -393,8 +410,17 @@ def start_session(
                         top_cam=top, left_cam=cam_l, right_cam=cam_r,
                         left_arm=left, right_arm=right,
                         rerun=rerun,
-                        stop=watcher.predicate(),
+                        stop=_combined_stop,
                     )
+                    # If the watchdog tripped (not operator), treat the
+                    # exit as a soft crash -- camera state is uncertain,
+                    # so the post-attempt ramp gate should engage.
+                    if cam_watchdog.stopped:
+                        attempt_crashed = True
+                        attempt_error = RuntimeError(
+                            f"camera watchdog tripped: {cam_watchdog.stop_reason}"
+                        )
+                        log.error("[camera-watchdog] %s", cam_watchdog.stop_reason)
                 except KeyboardInterrupt:
                     # Operator-driven abort. Propagate to outer except.
                     raise
@@ -409,6 +435,7 @@ def start_session(
                 finally:
                     # Restore cooked stdin BEFORE any input() call.
                     watcher.stop()
+                    cam_watchdog.stop()
 
                 # --- DANGER WINDOW ---
                 # If the attempt crashed (esp. due to camera disconnect

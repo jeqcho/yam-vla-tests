@@ -188,13 +188,22 @@ def load_setup_config(path: Optional[str] = None) -> dict:
 # ---------------------------------------------------------------------------
 
 class CameraStream:
-    """Base camera interface: start, grab one HxWx3 uint8 RGB frame, stop."""
+    """Base camera interface: start, grab one HxWx3 uint8 RGB frame, stop.
+
+    Subclasses MUST update `self.last_frame_ts = time.monotonic()` after
+    every successful grab. The CameraHealthWatcher polls this field to
+    detect cameras that have gone silent (which precedes the USB-CAN
+    correlation that drops the arms on this rig).
+    """
 
     def __init__(self, name: str, width: int, height: int, fps: int):
         self.name = name
         self.width = width
         self.height = height
         self.fps = fps
+        # Initialized to a far-future-rejecting value; subclass start()
+        # should set it to time.monotonic() once the first frame lands.
+        self.last_frame_ts: float = 0.0
 
     def start(self) -> None: raise NotImplementedError
     def grab(self) -> np.ndarray: raise NotImplementedError
@@ -231,6 +240,8 @@ class RealSenseStream(CameraStream):
                 f"camera {self.name} (RealSense {self.serial}) produced no "
                 f"frames within {budget_s:.0f}s -- check USB port + cable."
             )
+        # Seed last_frame_ts so the watchdog doesn't fire on first poll.
+        self.last_frame_ts = time.monotonic()
         log.info("camera %s (RealSense %s) started @ %dx%d/%d Hz (warmup %d)",
                  self.name, self.serial, self.width, self.height, self.fps, got)
 
@@ -271,6 +282,7 @@ class RealSenseStream(CameraStream):
         color = frames.get_color_frame()
         if not color:
             raise RuntimeError(f"camera {self.name} produced no color frame")
+        self.last_frame_ts = time.monotonic()  # CameraHealthWatcher reads this
         return np.asanyarray(color.get_data())
 
     def _restart_pipeline(self) -> None:
@@ -335,6 +347,7 @@ class V4L2Stream(CameraStream):
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
         for _ in range(5):
             self.cap.read()  # AE settle
+        self.last_frame_ts = time.monotonic()
         log.info("camera %s (V4L2 %s) started @ %dx%d/%d Hz",
                  self.name, self.device, self.width, self.height, self.fps)
 
@@ -343,11 +356,114 @@ class V4L2Stream(CameraStream):
         ok, frame = self.cap.read()
         if not ok:
             raise RuntimeError(f"camera {self.name} produced no frame")
+        self.last_frame_ts = time.monotonic()  # CameraHealthWatcher reads this
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     def stop(self) -> None:
         if self.cap is not None:
             self.cap.release()
+
+
+class CameraHealthWatcher:
+    """Background thread that monitors camera frame staleness.
+
+    Polls each camera's `last_frame_ts` every `poll_interval_s`. If any
+    camera goes stale for >`stale_threshold_s`, sets a stop flag. The
+    control loop's `stop` predicate reads this flag and exits the
+    rollout cleanly BEFORE the next `grab()` would block for 1.5 s.
+
+    Why this matters on this rig:
+    Camera USB disconnects on this hardware correlate with CAN-USB
+    bus disturbances (shared USB controllers). The cascade is:
+        camera disconnect -> USB-side disturbance -> CAN errors ->
+        motor watchdog fires (~500ms) -> motors release torque ->
+        arms fall under gravity.
+    Detecting the camera issue within ~100ms (vs the 1500ms grab
+    timeout) buys ~1 second of head start before the motor watchdog
+    fires. That second is often the difference between "rollout
+    exits cleanly" and "arms drop and break things."
+
+    What this DOES NOT do:
+    - Issue any motor commands. Just signals "stop the rollout."
+      The runner's post-crash gate then prompts the operator before
+      any arm motion happens.
+    - Prevent the underlying USB-CAN correlation. That's hardware.
+    - Recover from a camera that's already been silent (it would have
+      to be running before the camera goes silent to detect it).
+
+    Usage:
+        watcher = CameraHealthWatcher([top, left, right], stale_threshold_s=0.6)
+        watcher.start()
+        try:
+            run_attempt(..., stop=combined_stop_predicate(advance, watcher))
+        finally:
+            watcher.stop()
+    """
+
+    def __init__(
+        self,
+        cameras: list["CameraStream"],
+        stale_threshold_s: float = 0.6,
+        poll_interval_s: float = 0.1,
+    ):
+        self.cameras = list(cameras)
+        self.stale_threshold_s = stale_threshold_s
+        self.poll_interval_s = poll_interval_s
+        self._stopped = False
+        self._stop_reason: Optional[str] = None
+        self._stop_thread = False
+        self._thread = None
+
+    def start(self) -> None:
+        """Begin polling. Cameras should already have streamed at least
+        one frame (last_frame_ts > 0) before this is called -- otherwise
+        the watcher fires immediately."""
+        import threading
+
+        # Seed any cameras that haven't produced a frame yet, so we
+        # don't fire on the very first poll.
+        now = time.monotonic()
+        for c in self.cameras:
+            if c.last_frame_ts <= 0:
+                c.last_frame_ts = now
+
+        def _watch():
+            while not self._stop_thread:
+                now = time.monotonic()
+                for c in self.cameras:
+                    age = now - c.last_frame_ts
+                    if age > self.stale_threshold_s:
+                        self._stop_reason = (
+                            f"camera {c.name} stale {age:.2f}s "
+                            f"(threshold {self.stale_threshold_s:.2f}s)"
+                        )
+                        log.warning(
+                            "[camera-watchdog] %s -- aborting rollout for safety",
+                            self._stop_reason,
+                        )
+                        self._stopped = True
+                        return
+                time.sleep(self.poll_interval_s)
+
+        self._thread = threading.Thread(target=_watch, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the watcher thread to exit and wait briefly for it."""
+        self._stop_thread = True
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped
+
+    @property
+    def stop_reason(self) -> Optional[str]:
+        return self._stop_reason
+
+    def predicate(self):
+        return lambda: self._stopped
 
 
 def make_camera(
@@ -527,6 +643,7 @@ __all__ = [
     "install_sdk_lock_fix", "load_setup_config",
     # cameras
     "CameraStream", "RealSenseStream", "V4L2Stream", "make_camera",
+    "CameraHealthWatcher",
     # arms
     "init_arm", "read_state", "ramp_to_pose",
     # canonical ready pose
