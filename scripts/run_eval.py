@@ -116,13 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
                      help="per-tick arm-joint clip (rad). 0 disables.")
     grp.add_argument("--gripper-step", type=float, default=0.15,
                      help="per-tick gripper clip (normalized). 0 disables.")
-    grp.add_argument("--camera-stale-threshold-s", type=float, default=0.6,
+    grp.add_argument("--camera-stale-threshold-s", type=float, default=2.0,
                      dest="camera_stale_threshold_s",
                      help="if any camera goes >N seconds without producing "
-                          "a frame, abort the rollout immediately. Buys ~1s "
-                          "head-start over the natural grab() timeout, which "
-                          "is the difference between safe-exit and arm-drop "
-                          "on this rig (camera/CAN USB correlation).")
+                          "a frame, abort the rollout immediately. Default "
+                          "2.0s; must be > the control-loop cycle time "
+                          "(~1.2s at stride=30, 30Hz) to avoid false-positives "
+                          "during normal play. Buys head-start vs grab() "
+                          "timeout, mitigating camera/CAN USB correlation.")
     grp.add_argument("--no-return-on-exit", action="store_true",
                      help="DANGEROUS: skip return-to-startup ramp on exit. "
                           "Arms will drop when motors disable.")

@@ -403,7 +403,7 @@ class CameraHealthWatcher:
     def __init__(
         self,
         cameras: list["CameraStream"],
-        stale_threshold_s: float = 0.6,
+        stale_threshold_s: float = 2.0,
         poll_interval_s: float = 0.1,
     ):
         self.cameras = list(cameras)
@@ -415,17 +415,18 @@ class CameraHealthWatcher:
         self._thread = None
 
     def start(self) -> None:
-        """Begin polling. Cameras should already have streamed at least
-        one frame (last_frame_ts > 0) before this is called -- otherwise
-        the watcher fires immediately."""
+        """Begin polling. ALWAYS re-seeds each camera's last_frame_ts
+        to `now` so the watchdog only detects staleness that happens
+        AFTER it starts. If we used the camera's existing timestamp,
+        any gap between camera-start-of-session and watchdog-start
+        (e.g. operator reading the task banner before pressing ->)
+        would instantly trip the watchdog because the timestamp is
+        from session-init, not from the rollout's first grab."""
         import threading
 
-        # Seed any cameras that haven't produced a frame yet, so we
-        # don't fire on the very first poll.
         now = time.monotonic()
         for c in self.cameras:
-            if c.last_frame_ts <= 0:
-                c.last_frame_ts = now
+            c.last_frame_ts = now
 
         def _watch():
             while not self._stop_thread:
