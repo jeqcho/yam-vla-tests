@@ -39,11 +39,12 @@ from yam_vla.core.keyboard import (
 
 from yam_vla.core import (
     AttemptKnobs, AttemptStats, PolicyConfig, Policy, RerunRecorder,
-    capture_invocation, init_arm, load_setup_config, make_camera,
+    capture_invocation, load_setup_config, make_camera,
     prompt_journal_entry, ramp_to_pose, run_attempt, write_journal_entry,
     DEFAULT_CAM_WIDTH, DEFAULT_CAM_HEIGHT, DEFAULT_CAM_FPS,
     DEFAULT_HORIZON_STRIDE, DEFAULT_TRAIN_FPS,
     DEFAULT_MAX_STEP_RAD, DEFAULT_GRIPPER_STEP, DEFAULT_JOURNAL_PATH,
+    get_backend,
 )
 
 from evals._harness.results import ResultsWriter, AttemptRow
@@ -218,8 +219,15 @@ def start_session(
     invocation = capture_invocation()
     session_start_s = time.time()
 
-    # Per-machine defaults from yam_setup_config.json
-    setup_cfg = load_setup_config()
+    # Resolve the active embodiment backend. `run_eval.py` stashes one on
+    # args; fall back to YAM for any caller that built a Namespace by hand
+    # without going through the CLI (e.g. notebooks).
+    backend = getattr(args, "_backend", None) or get_backend(
+        getattr(args, "embodiment", "yam")
+    )
+
+    # Per-machine defaults from the backend's setup-config file.
+    setup_cfg = load_setup_config(backend.default_setup_config_path())
 
     results = ResultsWriter(
         base_dir=results_base_dir,
@@ -275,12 +283,11 @@ def start_session(
                 try: c.grab()
                 except Exception as e: log.warning("settle: %s.grab() failed: %s", c.name, e)
 
-        # ---------- arms ----------
-        gripper = getattr(args, "gripper", None) or setup_cfg.get("gripper", "linear_4310")
-        left_can  = getattr(args, "left_can",  None) or setup_cfg.get("left_can",  "can0")
-        right_can = getattr(args, "right_can", None) or setup_cfg.get("right_can", "can1")
-        left  = init_arm(left_can,  gripper)
-        right = init_arm(right_can, gripper)
+        # ---------- arms (per-embodiment backend) ----------
+        backend.install_quirks()
+        hw_cfg = backend.resolve_hw_cfg(args, setup_cfg)
+        left  = backend.init_left(hw_cfg)
+        right = backend.init_right(hw_cfg)
 
         # Capture startup pose for return-on-exit
         startup_pose = np.concatenate([
@@ -378,6 +385,8 @@ def start_session(
                     policy_opts={"num_steps": getattr(args, "num_steps", 10)},
                 )
                 print("\n[running] arms moving. press → (or Enter) to STOP.", flush=True)
+                attempt_crashed = False
+                attempt_error: Optional[BaseException] = None
                 try:
                     stats = run_attempt(
                         policy=policy, knobs=knobs,
@@ -386,31 +395,91 @@ def start_session(
                         rerun=rerun,
                         stop=watcher.predicate(),
                     )
+                except KeyboardInterrupt:
+                    # Operator-driven abort. Propagate to outer except.
+                    raise
+                except Exception as e:
+                    attempt_crashed = True
+                    attempt_error = e
+                    log.error("attempt crashed: %s", e)
+                    # Fabricate a minimal stats so downstream CSV write
+                    # doesn't NameError. Status will be "crash".
+                    from yam_vla.core import AttemptStats
+                    stats = AttemptStats(status="crash")
                 finally:
-                    # Restore cooked stdin BEFORE the score input() call.
+                    # Restore cooked stdin BEFORE any input() call.
                     watcher.stop()
 
-                # Ramp back to canonical ready pose BEFORE the operator
-                # scores or resets the scene. Two reasons:
-                #   1. The next iteration's policy must start from an
-                #      in-distribution pose (the centroid of training).
-                #   2. The operator should not be resetting velcro /
-                #      cubes / cups with the arms flopped wherever the
-                #      policy abandoned them -- it's awkward and risks
-                #      grippers occluding the scene.
-                if ready_pose is not None:
-                    # Refresh gripper preservation from current state so
-                    # we don't slam-close on something the policy just
-                    # grasped (and is still holding mid-rollout).
-                    cur = np.concatenate([
-                        np.asarray(left.get_joint_pos(),  dtype=np.float32),
-                        np.asarray(right.get_joint_pos(), dtype=np.float32),
-                    ])
-                    rp_now = ready_pose.copy()
-                    rp_now[6]  = cur[6]
-                    rp_now[13] = cur[13]
-                    log.info("Ramping back to ready pose (%.1fs)...", ready_pose_ramp_s)
+                # --- DANGER WINDOW ---
+                # If the attempt crashed (esp. due to camera disconnect
+                # which on this rig is correlated with CAN-USB disruption),
+                # the motor comms may be down and `get_joint_pos()` may
+                # return stale cached values. Issuing a ramp from stale
+                # cached pose to ready pose will compute a SMALL delta
+                # (because cache says "you're near ready") but the arms
+                # have physically dropped under gravity -- so when motor
+                # comms recover the motors snap from current-fallen pose
+                # to the commanded interpolated trajectory. This is
+                # whiplash and broke a camera stand on 2026-05-28.
+                #
+                # Mitigation: do NOT auto-ramp after a crash. Warn the
+                # operator instead. They visually inspect the arms,
+                # decide whether to ramp (slowly), and either re-arm or
+                # skip.
+                if attempt_crashed:
+                    print("\n" + "!" * 70, flush=True)
+                    print("!  ATTEMPT CRASHED  --  hardware state may be UNSAFE", flush=True)
+                    print("!", flush=True)
+                    print(f"!  reason: {attempt_error}", flush=True)
+                    print("!", flush=True)
+                    print("!  Motors may have lost CAN comms and torque during the crash.", flush=True)
+                    print("!  If arms physically dropped under gravity, issuing motion", flush=True)
+                    print("!  commands now will cause them to SNAP back to commanded", flush=True)
+                    print("!  position -- this is dangerous and has caused damage on", flush=True)
+                    print("!  this rig before. Please VISUALLY INSPECT THE ARMS NOW.", flush=True)
+                    print("!" * 70, flush=True)
+                    print("\n  → / Enter  -- arms LOOK ok, ramp back slowly (10s)", flush=True)
+                    print("  's'        -- arms look BAD, skip ramp, go to scoring", flush=True)
+                    print("  'q'        -- abort eval entirely (you'll re-arm by hand)", flush=True)
+                    ans = _wait_for_advance("")
+                    if ans == "quit":
+                        raise KeyboardInterrupt
+                    elif ans == "go":
+                        # Slow ramp (10s, 2x normal) and explicitly re-read
+                        # joint pos in case it was stale. If get_joint_pos
+                        # itself raises (motor comms still bad), skip ramp.
+                        try:
+                            cur = np.concatenate([
+                                np.asarray(left.get_joint_pos(),  dtype=np.float32),
+                                np.asarray(right.get_joint_pos(), dtype=np.float32),
+                            ])
+                            if ready_pose is not None:
+                                rp_now = ready_pose.copy()
+                                rp_now[6]  = cur[6]
+                                rp_now[13] = cur[13]
+                                slow_ramp_s = max(10.0, ready_pose_ramp_s * 2)
+                                log.info("[post-crash] Slow ramp to ready pose (%.1fs)...",
+                                         slow_ramp_s)
+                                ramp_to_pose(left, right, rp_now,
+                                             duration_s=slow_ramp_s,
+                                             label="post-crash slow-ramp")
+                        except Exception as e:
+                            log.error("post-crash ramp aborted: %s", e)
+                    # else ans == "skip": fall through to scoring with arms wherever they are
+                elif ready_pose is not None:
+                    # Normal path -- attempt completed cleanly. Ramp back
+                    # to canonical ready pose so the next iteration starts
+                    # from the training-distribution centroid and the
+                    # operator can reset the scene without flopped arms.
                     try:
+                        cur = np.concatenate([
+                            np.asarray(left.get_joint_pos(),  dtype=np.float32),
+                            np.asarray(right.get_joint_pos(), dtype=np.float32),
+                        ])
+                        rp_now = ready_pose.copy()
+                        rp_now[6]  = cur[6]
+                        rp_now[13] = cur[13]
+                        log.info("Ramping back to ready pose (%.1fs)...", ready_pose_ramp_s)
                         ramp_to_pose(left, right, rp_now,
                                      duration_s=ready_pose_ramp_s,
                                      label="post-attempt ramp-to-ready")

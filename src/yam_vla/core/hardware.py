@@ -235,25 +235,38 @@ class RealSenseStream(CameraStream):
                  self.name, self.serial, self.width, self.height, self.fps, got)
 
     def grab(self) -> np.ndarray:
-        # Two-attempt grab: a clean retry on transient timeouts AND a
-        # full pipeline restart on librealsense state corruption. The
-        # latter happens when wait_for_frames hits a hard error and
-        # the underlying pipeline gets implicitly stopped; subsequent
-        # calls raise "cannot be called before start()". We've seen
-        # this with marginal USB-3 contacts on D405 (camera 352122...).
+        # FAIL-FAST grab semantics. Previous version blocked up to ~15 s
+        # on a hard camera disconnect while attempting an in-process
+        # pipeline restart. On this rig that long blocking window
+        # correlates with CAN-USB disruption (cameras and CAN dongles
+        # share USB controllers), which causes the motor chain to lose
+        # comms and arms to fall under gravity. When comms return the
+        # arms snap to commanded position -- whiplash that broke
+        # a camera stand on 2026-05-28.
+        #
+        # New behavior:
+        #   - Primary wait: 1.5 s (was 2 s)
+        #   - On timeout: ONE quick pipeline restart attempt with a
+        #     1.5 s warmup budget (was 5 s); if that fails, RAISE.
+        #   - Total max blocking: ~3 s (was ~15 s)
+        #
+        # The runner catches the raise, marks the attempt crashed, and
+        # PROMPTS the operator before doing any further arm motion --
+        # so a quick fail here is much safer than a long block.
         try:
-            frames = self.pipeline.wait_for_frames(timeout_ms=2000)
+            frames = self.pipeline.wait_for_frames(timeout_ms=1500)
         except RuntimeError as e1:
-            log.warning("camera %s (%s): grab timeout (%s); restarting pipeline",
+            log.warning("camera %s (%s): grab timeout (%s); attempting quick restart",
                         self.name, self.serial, e1)
-            self._restart_pipeline()
             try:
-                frames = self.pipeline.wait_for_frames(timeout_ms=3000)
-            except RuntimeError as e2:
+                self._restart_pipeline()
+                frames = self.pipeline.wait_for_frames(timeout_ms=1500)
+            except (RuntimeError, Exception) as e2:
                 raise RuntimeError(
-                    f"camera {self.name} ({self.serial}) grab failed after "
-                    f"pipeline restart: {e2}. Physically replug the USB-C "
-                    f"cable and re-run list_cams.py to verify USB 3 link."
+                    f"camera {self.name} ({self.serial}) grab failed: {e2}. "
+                    f"Crashed-attempt path will run -- arms will NOT move "
+                    f"automatically. Physically inspect arms + camera, then "
+                    f"re-run list_cams.py to verify USB 3 link."
                 ) from e2
         color = frames.get_color_frame()
         if not color:
@@ -261,15 +274,9 @@ class RealSenseStream(CameraStream):
         return np.asanyarray(color.get_data())
 
     def _restart_pipeline(self) -> None:
-        """Tear down and re-establish the RealSense pipeline. Used
-        when grab() detects a state-corrupted pipeline. Re-runs USB
-        SuperSpeed negotiation as a side effect (it's a brand-new
-        rs.pipeline() instance, not a restart-in-place).
-
-        Uses a shorter warmup budget (5 s vs the 20 s on first start)
-        because we're recovering mid-rollout and can't afford a long
-        stall. If the camera can't produce 3 frames in 5 s, it's
-        almost certainly a hardware issue the operator needs to fix.
+        """Tear down and re-establish the RealSense pipeline. FAIL-FAST
+        variant: 1.5 s warmup budget. Caller is expected to handle the
+        raise without blocking longer.
         """
         import pyrealsense2 as rs
         try:
@@ -277,27 +284,27 @@ class RealSenseStream(CameraStream):
         except RuntimeError:
             # Pipeline was already stopped (the corruption case) -- expected.
             pass
-        # Brief settle so the USB layer can re-arbitrate.
-        time.sleep(0.2)
+        # Brief settle so the USB layer can re-arbitrate. Keep this short:
+        # any blocking here directly extends the danger window.
+        time.sleep(0.1)
         cfg = rs.config()
         cfg.enable_device(self.serial)
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
         self.pipeline = rs.pipeline()
         self.pipeline.start(cfg)
-        budget_s = 5.0
+        budget_s = 1.5
         deadline = time.monotonic() + budget_s
         got = 0
-        while got < 3 and time.monotonic() < deadline:
+        while got < 2 and time.monotonic() < deadline:
             try:
-                self.pipeline.wait_for_frames(timeout_ms=1000)
+                self.pipeline.wait_for_frames(timeout_ms=600)
                 got += 1
             except Exception:
                 pass
         if got == 0:
             raise RuntimeError(
                 f"camera {self.name} ({self.serial}) produced no frames "
-                f"within {budget_s:.0f}s after restart -- USB link is dead. "
-                f"Physically replug and re-run list_cams.py."
+                f"within {budget_s:.1f}s after restart -- USB link is dead."
             )
         log.info("camera %s (%s) pipeline restarted (warmup %d frames)",
                  self.name, self.serial, got)
@@ -372,32 +379,25 @@ def make_camera(
 # ---------------------------------------------------------------------------
 
 def init_arm(can_channel: str, gripper: str, ee_mass: Optional[float] = None):
-    """Create a YAM follower robot in position-holding mode.
+    """Back-compat shim around YamBackend.init_left/init_right.
 
-    Position-holding (kp != 0) rather than zero_gravity_mode: gravity comp can
-    be slightly mis-tuned and the arm drifts; position-hold actively keeps
-    whatever pose it has at script start.
+    Original direct callers (REPL, eval harness) now go through
+    `yam_vla.embodiments.get_backend(...)` so trlc-dk1 can slot in
+    alongside YAM. This function stays for any external code that
+    imported `init_arm` directly. Position-holding (kp != 0) rather than
+    zero_gravity_mode: gravity comp can be slightly mis-tuned and the
+    arm drifts; position-hold actively keeps whatever pose it has at
+    script start.
     """
-    install_sdk_lock_fix()
-    from i2rt.robots.get_robot import get_yam_robot
-    from i2rt.robots.utils import ArmType, GripperType
-
-    arm_type = ArmType.from_string_name("yam")
-    gripper_type = GripperType.from_string_name(gripper)
-    log.info("init_arm(%s, %s): get_yam_robot (gripper auto-cal ~3-5s)",
-             can_channel, gripper)
-    robot = get_yam_robot(
-        channel=can_channel,
-        arm_type=arm_type,
-        gripper_type=gripper_type,
-        zero_gravity_mode=False,
-        ee_mass=ee_mass,
+    from yam_vla.embodiments import get_backend
+    backend = get_backend("yam")
+    backend.install_quirks()
+    # Both init_left and init_right call the same private _init_arm
+    # under the hood; we expose it directly to preserve the historical
+    # "init one arm at a time given a CAN channel" signature.
+    return backend._init_arm(  # type: ignore[attr-defined]
+        can_channel=can_channel, gripper=gripper, ee_mass=ee_mass,
     )
-    q0 = np.asarray(robot.get_joint_pos(), dtype=np.float32)
-    log.info("init_arm(%s): pose=%s, commanding hold",
-             can_channel, np.array2string(q0, precision=3))
-    robot.command_joint_pos(q0)
-    return robot
 
 
 def read_state(left, right) -> np.ndarray:
